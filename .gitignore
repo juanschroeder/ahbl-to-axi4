@@ -1,0 +1,7 @@
+
+# verilator output
+*.vcd
+results.xml
+sim_build
+
+tb/__pycache__
