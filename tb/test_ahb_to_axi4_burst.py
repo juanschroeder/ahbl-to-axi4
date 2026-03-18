@@ -7085,3 +7085,328 @@ async def test_regression_bug8_back_to_back_incr8_writes_dropped(dut):
         "PASS: Bug #8 regression — back-to-back INCR8 writes with "
         "HREADYIN=1 during ST_WR_RESP correctly captured via pnd_valid"
     )
+
+@cocotb.test()
+async def test_combined_minimal_sparse_guard_then_bug8(dut):
+    set_test_id(dut)
+
+    errors = []
+
+    # ------------------------------------------------------------------
+    # Common local reset helper (do NOT restart clock)
+    # ------------------------------------------------------------------
+    async def _local_reset_only():
+        dut.resetn.value = 0
+        _init_direct_ahb_signals(dut)
+        _init_manual_axi_slave_inputs(dut)
+        dut.hsel.value = 1
+        dut.hreadyin.value = 1
+        await ClockCycles(dut.clk, 5)
+        dut.resetn.value = 1
+        await ClockCycles(dut.clk, 3)
+
+    await setup_dut_no_axi_slave(dut)
+
+    # ==================================================================
+    # PHASE A: reduced version of the long sparse write guard
+    # ==================================================================
+    dut._log.info("PHASE A: reduced sparse guard")
+
+    mem_a = {}
+    wr_task = cocotb.start_soon(axi_sparse_mem_write_slave(dut, mem_a))
+    rd_task = cocotb.start_soon(axi_sparse_mem_read_slave(dut, mem_a))
+
+    try:
+        stack_addr   = 0xBFFFFBC0
+        load_base    = 0x80000000
+        sentinel     = 0xDEADBEEFCAFEBABE
+        chunk_beats  = 16
+        chunk_count  = 8          # 8 * INCR16 = 128 beats total, still tiny
+        load_beats   = chunk_beats * chunk_count
+        load_size    = load_beats * 8
+
+        def pattern(addr):
+            word_index = (addr - load_base) >> 3
+            return (0x1234000000000000 | word_index) ^ 0x55AA55AA55AA55AA
+
+        # Step A1: sentinel write/read before bulk stream
+        await with_timeout(
+            ahb_write_single_manual(dut, stack_addr, sentinel, size_bytes=8),
+            200, "us"
+        )
+
+        await ClockCycles(dut.clk, 3)
+
+        got0 = await with_timeout(
+            ahb_read_inc_burst_manual(dut, stack_addr, 1, size_bytes=8, fixed=True),
+            200, "us"
+        )
+        assert got0 == [sentinel], (
+            f"PHASE A initial sentinel mismatch: expected 0x{sentinel:016x}, "
+            f"got 0x{got0[0]:016x}"
+        )
+
+        # Step A2: reduced contiguous load using only INCR16 chunks
+        for chunk_idx in range(chunk_count):
+            addr = load_base + chunk_idx * chunk_beats * 8
+            beats = [pattern(addr + i * 8) for i in range(chunk_beats)]
+
+            await with_timeout(
+                ahb_write_inc_burst_manual(
+                    dut,
+                    addr,
+                    beats,
+                    size_bytes=8,
+                    fixed=True,
+                ),
+                300, "us"
+            )
+
+        await ClockCycles(dut.clk, 3)
+
+        # Step A3: sentinel must still be intact
+        got_stack = await with_timeout(
+            ahb_read_inc_burst_manual(dut, stack_addr, 1, size_bytes=8, fixed=True),
+            200, "us"
+        )
+        assert got_stack == [sentinel], (
+            f"PHASE A stack sentinel corrupted: expected 0x{sentinel:016x}, "
+            f"got 0x{got_stack[0]:016x}"
+        )
+
+        # Step A4: full readback of the reduced loaded region
+        for chunk_idx in range(chunk_count):
+            addr = load_base + chunk_idx * chunk_beats * 8
+            exp  = [pattern(addr + i * 8) for i in range(chunk_beats)]
+
+            got = await with_timeout(
+                ahb_read_inc_burst_manual(
+                    dut,
+                    addr,
+                    chunk_beats,
+                    size_bytes=8,
+                    fixed=True,
+                ),
+                300, "us"
+            )
+
+            assert len(got) == chunk_beats, (
+                f"PHASE A chunk {chunk_idx}: expected {chunk_beats} beats, got {len(got)}"
+            )
+
+            for beat_idx, (g, e) in enumerate(zip(got, exp)):
+                assert g == e, (
+                    f"PHASE A chunk {chunk_idx} beat {beat_idx}: "
+                    f"got 0x{g:016x}, expected 0x{e:016x}"
+                )
+
+        start_expected = pattern(load_base)
+        end_addr = load_base + load_size - 8
+        end_expected = pattern(end_addr)
+
+        got_start = await with_timeout(
+            ahb_read_inc_burst_manual(dut, load_base, 1, size_bytes=8, fixed=True),
+            200, "us"
+        )
+        got_end = await with_timeout(
+            ahb_read_inc_burst_manual(dut, end_addr, 1, size_bytes=8, fixed=True),
+            200, "us"
+        )
+
+        assert got_start == [start_expected], (
+            f"PHASE A load_base mismatch: expected 0x{start_expected:016x}, "
+            f"got 0x{got_start[0]:016x}"
+        )
+        assert got_end == [end_expected], (
+            f"PHASE A load_end mismatch: expected 0x{end_expected:016x}, "
+            f"got 0x{got_end[0]:016x}"
+        )
+
+        dut._log.info("PHASE A PASS: reduced sparse guard")
+    except Exception as e:
+        errors.append(f"PHASE A FAILED: {e}")
+        dut._log.error(f"PHASE A FAILED: {e}")
+    finally:
+        wr_task.kill()
+        rd_task.kill()
+
+    # Reset DUT before Bug8 phase so the two phases are independent
+    await _local_reset_only()
+
+    # ==================================================================
+    # PHASE B: exact Bug8 reproducer
+    # ==================================================================
+    dut._log.info("PHASE B: Bug8 reproducer")
+
+    try:
+        ADDR_A = 0x00001000
+        ADDR_B = 0x00001040
+        DATA_A = [0xAA00_0000_0000_0000 | i for i in range(8)]
+        DATA_B = [0xBB00_0000_0000_0000 | i for i in range(8)]
+
+        HBURST_INCR8 = 0b101
+        HSIZE_64     = 3
+        B_DELAY      = 4
+
+        mem_b = {}
+
+        slave_task = cocotb.start_soon(
+            _bug8_axi_write_slave_multi(dut, mem_b, burst_count=2, b_delay=B_DELAY)
+        )
+
+        dut.hsel.value     = 1
+        dut.hreadyin.value = 1
+
+        # --------------------------------------------------------------
+        # Burst 1
+        # --------------------------------------------------------------
+        dut.haddr.value  = ADDR_A
+        dut.hburst.value = HBURST_INCR8
+        dut.hsize.value  = HSIZE_64
+        dut.htrans.value = 0b10   # NONSEQ
+        dut.hwrite.value = 1
+        dut.hwdata.value = 0
+
+        for beat in range(8):
+            while True:
+                await RisingEdge(dut.clk)
+                await ReadOnly()
+                hr = int(dut.hready.value)
+                await NextTimeStep()
+                dut.hreadyin.value = hr
+                if hr:
+                    break
+
+            if beat == 7:
+                dut.htrans.value = 0b00   # IDLE
+                dut.haddr.value  = 0
+                dut.hburst.value = 0
+                dut.hsize.value  = 0
+                dut.hwrite.value = 0
+            else:
+                dut.htrans.value = 0b11   # SEQ
+                dut.haddr.value  = ADDR_A + (beat + 1) * 8
+
+            dut.hwdata.value = DATA_A[beat]
+
+        # --------------------------------------------------------------
+        # Critical WR_RESP window for burst 2 injection
+        # --------------------------------------------------------------
+        await RisingEdge(dut.clk)
+        await NextTimeStep()
+        dut.hreadyin.value = 0
+
+        await RisingEdge(dut.clk)
+        await NextTimeStep()
+
+        dut.haddr.value    = ADDR_B
+        dut.hburst.value   = HBURST_INCR8
+        dut.hsize.value    = HSIZE_64
+        dut.htrans.value   = 0b10   # NONSEQ
+        dut.hwrite.value   = 1
+        dut.hsel.value     = 1
+        dut.hreadyin.value = 1
+
+        await RisingEdge(dut.clk)
+        await NextTimeStep()
+
+        dut.htrans.value   = 0b11   # SEQ
+        dut.haddr.value    = ADDR_B + 8
+        dut.hwdata.value   = DATA_B[0]
+        dut.hreadyin.value = 0
+
+        for beat in range(1, 8):
+            while True:
+                await RisingEdge(dut.clk)
+                await ReadOnly()
+                hr = int(dut.hready.value)
+                await NextTimeStep()
+                dut.hreadyin.value = hr
+                if hr:
+                    break
+
+            if beat == 7:
+                dut.htrans.value = 0b00
+                dut.haddr.value  = 0
+                dut.hburst.value = 0
+                dut.hsize.value  = 0
+                dut.hwrite.value = 0
+            else:
+                dut.htrans.value = 0b11
+                dut.haddr.value  = ADDR_B + (beat + 1) * 8
+
+            dut.hwdata.value = DATA_B[beat]
+
+        while True:
+            await RisingEdge(dut.clk)
+            await ReadOnly()
+            hr = int(dut.hready.value)
+            await NextTimeStep()
+            dut.hreadyin.value = hr
+            if hr:
+                break
+
+        _init_direct_ahb_signals(dut)
+        dut.hsel.value     = 1
+        dut.hreadyin.value = 1
+
+        await ClockCycles(dut.clk, 30)
+
+        results = await with_timeout(slave_task, 2000, "us")
+
+        assert len(results) == 2, (
+            f"PHASE B: expected 2 AXI write bursts, got {len(results)}"
+        )
+
+        aw1_addr, aw1_len, beats1 = results[0]
+        assert aw1_addr == ADDR_A, (
+            f"PHASE B burst 1 AWADDR=0x{aw1_addr:08x}, expected 0x{ADDR_A:08x}"
+        )
+        assert aw1_len == 7, f"PHASE B burst 1 AWLEN={aw1_len}, expected 7"
+        assert len(beats1) == 8, (
+            f"PHASE B burst 1: got {len(beats1)} W beats, expected 8"
+        )
+        for i, (wd, ws, wl) in enumerate(beats1):
+            assert wd == DATA_A[i], (
+                f"PHASE B burst 1 beat {i}: WDATA=0x{wd:016x}, "
+                f"expected 0x{DATA_A[i]:016x}"
+            )
+
+        aw2_addr, aw2_len, beats2 = results[1]
+        assert aw2_addr == ADDR_B, (
+            f"PHASE B burst 2 AWADDR=0x{aw2_addr:08x}, expected 0x{ADDR_B:08x}"
+        )
+        assert aw2_len == 7, f"PHASE B burst 2 AWLEN={aw2_len}, expected 7"
+        assert len(beats2) == 8, (
+            f"PHASE B burst 2: got {len(beats2)} W beats, expected 8"
+        )
+        for i, (wd, ws, wl) in enumerate(beats2):
+            assert wd == DATA_B[i], (
+                f"PHASE B burst 2 beat {i}: WDATA=0x{wd:016x}, "
+                f"expected 0x{DATA_B[i]:016x}"
+            )
+
+        for i in range(8):
+            addr = ADDR_A + i * 8
+            got = mem_b.get(addr, 0)
+            assert got == DATA_A[i], (
+                f"PHASE B mem[0x{addr:08x}]=0x{got:016x}, expected 0x{DATA_A[i]:016x}"
+            )
+
+        for i in range(8):
+            addr = ADDR_B + i * 8
+            got = mem_b.get(addr, 0)
+            assert got == DATA_B[i], (
+                f"PHASE B mem[0x{addr:08x}]=0x{got:016x}, expected 0x{DATA_B[i]:016x}"
+            )
+
+        dut._log.info("PHASE B PASS: Bug8 no longer reproduces")
+    except Exception as e:
+        errors.append(f"PHASE B FAILED: {e}")
+        dut._log.error(f"PHASE B FAILED: {e}")
+
+    # ==================================================================
+    # Final combined result
+    # ==================================================================
+    if errors:
+        raise AssertionError(" | ".join(errors))

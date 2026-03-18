@@ -14,7 +14,7 @@ VERILOG_SOURCES := \
 	$(DUT_SOURCES)
 
 
-MODULE   := test_ahb_to_axi4_burst_v54
+MODULE   := test_ahb_to_axi4_burst
 
 export PYTHONPATH := $(TB_DIR):$(PYTHONPATH)
 

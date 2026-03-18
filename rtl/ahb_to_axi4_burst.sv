@@ -212,6 +212,12 @@ module ahb_to_axi4_burst #(
   logic [DW-1:0]     pnd_wfirst_data;
   logic [DW/8-1:0]   pnd_wfirst_strb;
 
+  // Bug8-style pending fixed-burst mode:
+  // entered only when ST_WR_PND_ALIGN starts while HREADYIN=0.
+  // In that case pnd_wfirst_* becomes a 1-beat pipeline register
+  // for the whole pending burst.
+  logic              pnd_wpipe_mode;
+
   // wstrb derivation
   logic [DW/8-1:0] ahb_wstrb_d;
   logic [AW-1:0]   ahb_waddr_d;
@@ -349,10 +355,11 @@ module ahb_to_axi4_burst #(
       incr_wr_cont <= 1'b0;
       incr_drain   <= 1'b0;
       incr_rd_busy <= 1'b0;
-      pnd_valid    <= 1'b0;
+      pnd_valid        <= 1'b0;
       pnd_wfirst_valid <= 1'b0;
       pnd_wfirst_data  <= '0;
       pnd_wfirst_strb  <= '0;
+      pnd_wpipe_mode   <= 1'b0;
       // loop fix
       hsel_q      <= 1'b0;
       hreadyin_q  <= 1'b0;
@@ -483,6 +490,11 @@ module ahb_to_axi4_burst #(
           pnd_wfirst_valid <= 1'b1;
           pnd_wfirst_data  <= HWDATA;
           pnd_wfirst_strb  <= ahb_addrsize_to_wstrb(pnd_addr, pnd_size);
+
+          // Enable per-beat buffered pipeline only for the Bug8-style startup:
+          // pending fixed write begins while HREADYIN is still low.
+          pnd_wpipe_mode   <= !HREADYIN;
+
           state            <= ST_WR_D;
         end
 
@@ -497,11 +509,23 @@ module ahb_to_axi4_burst #(
 
           // Do not consume any fixed-write beat until AW has handshaken.
           if (aw_sent && WREADY) begin
-            // If this write started from a pending fixed-length burst,
-            // the first AXI W beat came from pnd_wfirst_*.
-            // Drop that override after the first accepted beat.
+            // Pending fixed-write handling:
+            // - normal pending startup: pnd_wfirst_* is beat 0 only
+            // - Bug8-style startup    : pnd_wfirst_* becomes a 1-beat pipeline
+            //   register for the whole pending burst
             if (pnd_wfirst_valid) begin
-              pnd_wfirst_valid <= 1'b0;
+              if (pnd_wpipe_mode) begin
+                if (beat_cnt != 8'd0) begin
+                  pnd_wfirst_data  <= HWDATA;
+                  pnd_wfirst_strb  <= ahb_wstrb_d;
+                  pnd_wfirst_valid <= 1'b1;
+                end else begin
+                  pnd_wfirst_valid <= 1'b0;
+                  pnd_wpipe_mode   <= 1'b0;
+                end
+              end else begin
+                pnd_wfirst_valid <= 1'b0;
+              end
             end
 
             // Capture the next transaction only on an actual accepted near-final beat.
