@@ -1,4 +1,4 @@
-module ahb_to_axi4_burst_cocotb_wrapper_v2 #(
+module ahb_to_axi4_burst_cocotb_wrapper_v3 #(
   parameter int unsigned AW = 32,
   parameter int unsigned DW = 64,
   parameter int unsigned IW = 4,

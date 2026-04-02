@@ -144,7 +144,8 @@ module ahb_to_axi4_burst #(
     ST_WR_INCR_POST_BUSY,   // INCR write: one-cycle stall after BUSY so HWDATA settles
     ST_WR_INCR_RESUME,      // INCR write: one free-running cycle after POST_BUSY; do not capture
     ST_WR_INCR_FLUSH,       // INCR write: drain buffer to AXI W channel
-    ST_WR_RESP,             // Both write paths: waiting for AXI B-channel
+    ST_WR_RESP,             // INCR flush path: waiting for AXI B-channel
+    ST_WR_LAST_RESP,        // Fixed write: last W accepted, AHB waits for AXI B
     ST_WR_ERR,              // AHB 2-cycle error cycle 2, write
     ST_RD_A,                // Read: present AR, wait for ARREADY
     ST_RD_D,                // Read: forward R beats to AHB
@@ -211,11 +212,6 @@ module ahb_to_axi4_burst #(
   logic              pnd_wfirst_valid;
   logic [DW-1:0]     pnd_wfirst_data;
   logic [DW/8-1:0]   pnd_wfirst_strb;
-
-  // Bug8-style pending fixed-burst mode:
-  // entered only when ST_WR_PND_ALIGN starts while HREADYIN=0.
-  // In that case pnd_wfirst_* becomes a 1-beat pipeline register
-  // for the whole pending burst.
   logic              pnd_wpipe_mode;
 
   // wstrb derivation
@@ -227,6 +223,9 @@ module ahb_to_axi4_burst #(
   // race condition fix
   logic [DW-1:0]   wdata_first;
   logic [DW/8-1:0] wstrb_first;
+  logic            wr_d_wvalid;
+  logic            wr_d_last_issue;
+  logic            wr_d_fire;
 
   // loops fix
   logic             hsel_q;
@@ -355,7 +354,7 @@ module ahb_to_axi4_burst #(
       incr_wr_cont <= 1'b0;
       incr_drain   <= 1'b0;
       incr_rd_busy <= 1'b0;
-      pnd_valid        <= 1'b0;
+      pnd_valid    <= 1'b0;
       pnd_wfirst_valid <= 1'b0;
       pnd_wfirst_data  <= '0;
       pnd_wfirst_strb  <= '0;
@@ -432,6 +431,8 @@ module ahb_to_axi4_burst #(
                 end else begin
                   beat_cnt    <= pnd_c_axlen;
                   aw_sent     <= 1'b0;
+                  pnd_wfirst_valid <= 1'b0;
+                  pnd_wpipe_mode   <= 1'b0;
                   wstrb_first <= ahb_addrsize_to_wstrb(pnd_addr, pnd_size);
                   state       <= ST_WR_PND_ALIGN;
                 end
@@ -487,15 +488,24 @@ module ahb_to_axi4_burst #(
         // HREADY=0 in this state keeps the first real data beat stable on HWDATA.
         // Capture that beat here, then start ST_WR_D on the next cycle.
         ST_WR_PND_ALIGN: begin
-          pnd_wfirst_valid <= 1'b1;
-          pnd_wfirst_data  <= HWDATA;
-          pnd_wfirst_strb  <= ahb_addrsize_to_wstrb(pnd_addr, pnd_size);
-
-          // Enable per-beat buffered pipeline only for the Bug8-style startup:
-          // pending fixed write begins while HREADYIN is still low.
-          pnd_wpipe_mode   <= !HREADYIN;
-
-          state            <= ST_WR_D;
+          // Two startup cases exist for a pending fixed write:
+          // 1) The master is still holding the pending NONSEQ address phase.
+          //    Give it one HREADY pulse so beat 0 reaches HWDATA next cycle.
+          // 2) The master has already advanced beyond that NONSEQ (bug8-style).
+          //    Beat 0 is already on HWDATA, so capture it immediately.
+          if (!pnd_wpipe_mode &&
+              (HADDR == pnd_addr) &&
+              (HTRANS == TRN_NONSEQ) &&
+              HWRITE) begin
+            pnd_wpipe_mode <= 1'b1;
+            state          <= ST_WR_PND_ALIGN;
+          end else begin
+            pnd_wfirst_valid <= 1'b1;
+            pnd_wfirst_data  <= HWDATA;
+            pnd_wfirst_strb  <= ahb_addrsize_to_wstrb(pnd_addr, pnd_size);
+            pnd_wpipe_mode   <= 1'b0;
+            state            <= ST_WR_D;
+          end
         end
 
         // ?????? ST_WR_D ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
@@ -508,11 +518,7 @@ module ahb_to_axi4_burst #(
           end
 
           // Do not consume any fixed-write beat until AW has handshaken.
-          if (aw_sent && WREADY) begin
-            // Pending fixed-write handling:
-            // - normal pending startup: pnd_wfirst_* is beat 0 only
-            // - Bug8-style startup    : pnd_wfirst_* becomes a 1-beat pipeline
-            //   register for the whole pending burst
+          if (wr_d_fire) begin
             if (pnd_wfirst_valid) begin
               if (pnd_wpipe_mode) begin
                 if (beat_cnt != 8'd0) begin
@@ -533,13 +539,14 @@ module ahb_to_axi4_burst #(
                 !pnd_valid &&
                 HSEL && HREADYIN &&
                 (HTRANS == TRN_NONSEQ)) begin
-              pnd_valid <= 1'b1;
-              pnd_addr  <= HADDR;
-              pnd_size  <= HSIZE;
-              pnd_burst <= HBURST;
-              pnd_write <= HWRITE;
-              pnd_prot  <= HPROT;
-              pnd_lock  <= HMASTLOCK;
+              pnd_valid      <= 1'b1;
+              pnd_addr       <= HADDR;
+              pnd_size       <= HSIZE;
+              pnd_burst      <= HBURST;
+              pnd_write      <= HWRITE;
+              pnd_prot       <= HPROT;
+              pnd_lock       <= HMASTLOCK;
+              pnd_wpipe_mode <= 1'b0;
             end
 
             if (beat_cnt != 8'd0) begin
@@ -550,7 +557,7 @@ module ahb_to_axi4_burst #(
               else if (BVALID && BRESP[1])
                 state <= ST_WR_ERR;
               else
-                state <= ST_WR_RESP;
+                state <= ST_WR_LAST_RESP;
             end
           end
         end
@@ -685,7 +692,7 @@ module ahb_to_axi4_burst #(
         ST_WR_INCR_FLUSH: begin
           if (!aw_sent && AWREADY)
             aw_sent <= 1'b1;
-          if (WREADY) begin
+          if (aw_sent && WREADY) begin
             if (flush_ptr != acc_cnt[IBUF_IDX_W-1:0] - 1'b1)
               flush_ptr <= flush_ptr + 1'b1;
             else begin
@@ -740,6 +747,31 @@ module ahb_to_axi4_burst #(
             end else begin
               state <= ST_IDLE;
             end
+          end
+        end
+
+        // Fixed-write wait state: last AXI W beat was accepted but B has not
+        // yet arrived. Hold AHB stalled until B handshakes. Capture any
+        // NONSEQ that appears during this window (bug8-style bus-mux case).
+        ST_WR_LAST_RESP: begin
+          if (!pnd_valid &&
+              HSEL && HREADYIN &&
+              (HTRANS == TRN_NONSEQ)) begin
+            pnd_valid      <= 1'b1;
+            pnd_addr       <= HADDR;
+            pnd_size       <= HSIZE;
+            pnd_burst      <= HBURST;
+            pnd_write      <= HWRITE;
+            pnd_prot       <= HPROT;
+            pnd_lock       <= HMASTLOCK;
+            pnd_wpipe_mode <= 1'b0;
+          end
+
+          if (BVALID) begin
+            if (BRESP[1])
+              state <= ST_WR_ERR;
+            else
+              state <= ST_IDLE;
           end
         end
 
@@ -1023,12 +1055,29 @@ module ahb_to_axi4_burst #(
           HREADY = 1'b1;
       end
 
-      ST_WR_PND_ALIGN: HREADY = 1'b0; // can remain unused
+      ST_WR_PND_ALIGN: begin
+        if (!pnd_wpipe_mode &&
+            (HADDR == pnd_addr) &&
+            (HTRANS == TRN_NONSEQ) &&
+            HWRITE)
+          HREADY = 1'b1;
+        else
+          HREADY = 1'b0;
+      end
 
       ST_WR_D: begin
-        // Fixed writes stall until AW handshakes.
-        // After that, AHB advances only when AXI W advances.
-        HREADY = aw_sent && WREADY;
+        if (!aw_sent) begin
+          HREADY = 1'b0;
+        end else if (beat_cnt != 8'd0) begin
+          HREADY = WREADY;
+        end else begin
+          if (BVALID && BRESP[1]) begin
+            HREADY = 1'b0;
+            HRESP  = 1'b1;
+          end else begin
+            HREADY = WREADY;
+          end
+        end
       end
 
       ST_WR_INCR_ACC:       HREADY = 1'b1;
@@ -1046,6 +1095,15 @@ module ahb_to_axi4_burst #(
           // The data phase for the NONSEQ has not yet completed; releasing
           // HREADY here would let the master slip one beat and misalign
           // the burst data.
+          HREADY = 1'b0;
+        end else begin
+          HREADY = BVALID & ~BRESP[1];
+          HRESP  = BVALID &  BRESP[1];
+        end
+      end
+
+      ST_WR_LAST_RESP: begin
+        if (pnd_valid) begin
           HREADY = 1'b0;
         end else begin
           HREADY = BVALID & ~BRESP[1];
@@ -1123,8 +1181,12 @@ module ahb_to_axi4_burst #(
   assign AWQOS   = 4'b0000;
   assign AWVALID = ((state == ST_WR_D) || (state == ST_WR_INCR_FLUSH)) && !aw_sent;
 
+  assign wr_d_wvalid           = (state == ST_WR_D) && aw_sent;
+  assign wr_d_last_issue       = wr_d_wvalid && (beat_cnt == 8'd0);
+  assign wr_d_fire             = wr_d_wvalid && WREADY;
+
   // ?????? AXI4: Write Data Channel ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
-  assign WVALID  = ((state == ST_WR_D) && aw_sent) || (state == ST_WR_INCR_FLUSH);
+  assign WVALID  = wr_d_wvalid || ((state == ST_WR_INCR_FLUSH) && aw_sent);
 
   assign WDATA = (state == ST_WR_INCR_FLUSH) ? ibuf_data[flush_ptr]
                : (((state == ST_WR_D) && pnd_wfirst_valid) ? pnd_wfirst_data
@@ -1133,13 +1195,14 @@ module ahb_to_axi4_burst #(
   assign WSTRB = (state == ST_WR_INCR_FLUSH) ? ibuf_strb[flush_ptr]
                : (((state == ST_WR_D) && pnd_wfirst_valid) ? pnd_wfirst_strb
                                                            : ahb_wstrb_d);
-  assign WLAST  = ((state == ST_WR_D)         && (beat_cnt  == 8'd0))             ||
+  assign WLAST  = ((state == ST_WR_D)         && (beat_cnt == 8'd0))               ||
                   ((state == ST_WR_INCR_FLUSH) && (flush_ptr == acc_cnt[IBUF_IDX_W-1:0] - 1'b1));
 
   // ?????? AXI4: Write Response Channel ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
   assign BREADY  = (state == ST_WR_RESP)
-                |  (state == ST_WR_D      && aw_sent && beat_cnt == 8'd0)
-                |  (state == ST_WR_INCR_FLUSH
+                |  (state == ST_WR_LAST_RESP)
+                |  wr_d_last_issue
+                |  (state == ST_WR_INCR_FLUSH && aw_sent
                     && flush_ptr == acc_cnt[IBUF_IDX_W-1:0] - 1'b1);
   // ?????? AXI4: Read Address Channel ?????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
   assign ARID    = '0;
@@ -1192,6 +1255,7 @@ module ahb_to_axi4_burst #(
         || (state == ST_WR_INCR_RESUME)
         || (state == ST_WR_INCR_FLUSH)
         || (state == ST_WR_RESP)
+        || (state == ST_WR_LAST_RESP)
         || (state == ST_WR_ERR)
         || (state == ST_RD_ERR)
       )

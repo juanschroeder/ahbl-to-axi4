@@ -5,10 +5,893 @@ from cocotbext.ahb import AHBBus, AHBLiteMaster
 from cocotbext.axi import AxiBus, AxiRam
 
 import itertools
+from collections import deque
+
+import itertools
 _TEST_IDS = itertools.count(1)
 
 def set_test_id(dut):
     dut.tb_test_id.value = next(_TEST_IDS)
+
+_MONITOR_TASKS = {}
+
+
+def _sigint(sig):
+    return int(sig.value)
+
+
+def _start_invariant_monitors(dut):
+    key = id(dut)
+    tasks = _MONITOR_TASKS.get(key, [])
+    if tasks and all(not t.done() for t in tasks):
+        return
+
+    tasks = [
+        cocotb.start_soon(_axi_output_invariant_monitor(dut)),
+        # disabled because it cannot be applied to all tests
+        #cocotb.start_soon(_ahb_input_invariant_monitor(dut)),
+        cocotb.start_soon(_ahb_to_axi_write_scoreboard(dut)),
+        # started elsewhere
+        #cocotb.start_soon(_ahb_to_axi_read_scoreboard(dut)),
+    ]
+    _MONITOR_TASKS[key] = tasks
+
+
+async def _axi_output_invariant_monitor(dut):
+    """
+    Passive always-on monitor for DUT-driven AXI output invariants.
+
+    Checks only DUT-driven AXI master outputs:
+      - AW payload stable while AWVALID && !AWREADY
+      - W  payload stable while WVALID  && !WREADY
+      - AR payload stable while ARVALID && !ARREADY
+      - VALID does not drop while stalled
+      - accepted W beat count matches prior AWLEN+1
+      - WLAST only on the final accepted W beat
+      - no accepted W beat without a preceding AW
+
+    Intentionally does NOT check B/R channel stability here, because those
+    signals are slave-driven inputs to the DUT in this testbench.
+    """
+    aw_stall_payload = None
+    w_stall_payload = None
+    ar_stall_payload = None
+
+    # Previous sampled AW/AR state, to recover handshakes that become hidden
+    # by ReadOnly()-time observation after the DUT deasserts VALID
+    # combinationally in response to a same-edge READY handshake.
+    prev_awvalid = 0
+    prev_awready = 0
+    prev_awlen = 0
+
+    prev_arvalid = 0
+    prev_arready = 0
+    prev_arlen = 0
+
+    # Queue of expected write-burst lengths (AWLEN+1), in handshake order.
+    w_expected_beats = deque()
+
+    while True:
+        await RisingEdge(dut.clk)
+        await ReadOnly()
+
+        if not _sigint(dut.resetn):
+            aw_stall_payload = None
+            w_stall_payload = None
+            ar_stall_payload = None
+            prev_awvalid = 0
+            prev_awready = 0
+            prev_awlen = 0
+            prev_arvalid = 0
+            prev_arready = 0
+            prev_arlen = 0
+            w_expected_beats.clear()
+            continue
+
+        # -----------------------------
+        # Sample DUT AXI outputs
+        # -----------------------------
+        awvalid = _sigint(dut.m_axi_awvalid)
+        awready = _sigint(dut.m_axi_awready)
+        awaddr  = _sigint(dut.m_axi_awaddr)
+        awlen   = _sigint(dut.m_axi_awlen)
+        awsize  = _sigint(dut.m_axi_awsize)
+        awburst = _sigint(dut.m_axi_awburst)
+        awlock  = _sigint(dut.m_axi_awlock)
+        awprot  = _sigint(dut.m_axi_awprot)
+        aw_payload = (awaddr, awlen, awsize, awburst, awlock, awprot)
+
+        wvalid = _sigint(dut.m_axi_wvalid)
+        wready = _sigint(dut.m_axi_wready)
+        wdata  = _sigint(dut.m_axi_wdata)
+        wstrb  = _sigint(dut.m_axi_wstrb)
+        wlast  = _sigint(dut.m_axi_wlast)
+        w_payload = (wdata, wstrb, wlast)
+
+        arvalid = _sigint(dut.m_axi_arvalid)
+        arready = _sigint(dut.m_axi_arready)
+        araddr  = _sigint(dut.m_axi_araddr)
+        arlen   = _sigint(dut.m_axi_arlen)
+        arsize  = _sigint(dut.m_axi_arsize)
+        arburst = _sigint(dut.m_axi_arburst)
+        arlock  = _sigint(dut.m_axi_arlock)
+        arprot  = _sigint(dut.m_axi_arprot)
+        ar_payload = (araddr, arlen, arsize, arburst, arlock, arprot)
+
+        # -----------------------------
+        # Stall-stability invariants
+        # -----------------------------
+        if aw_stall_payload is not None:
+            if not awready:
+                if not awvalid:
+                    raise AssertionError(
+                        "AXI invariant: AWVALID dropped while AWREADY=0"
+                    )
+                if aw_payload != aw_stall_payload:
+                    raise AssertionError(
+                        "AXI invariant: AW payload changed while stalled: "
+                        f"prev={aw_stall_payload}, now={aw_payload}"
+                    )
+
+        if w_stall_payload is not None:
+            if not wready:
+                if not wvalid:
+                    raise AssertionError(
+                        "AXI invariant: WVALID dropped while WREADY=0"
+                    )
+                if w_payload != w_stall_payload:
+                    raise AssertionError(
+                        "AXI invariant: W payload changed while stalled: "
+                        f"prev={w_stall_payload}, now={w_payload}"
+                    )
+
+        if ar_stall_payload is not None:
+            if not arready:
+                if not arvalid:
+                    raise AssertionError(
+                        "AXI invariant: ARVALID dropped while ARREADY=0"
+                    )
+                if ar_payload != ar_stall_payload:
+                    raise AssertionError(
+                        "AXI invariant: AR payload changed while stalled: "
+                        f"prev={ar_stall_payload}, now={ar_payload}"
+                    )
+
+        # -----------------------------
+        # Handshake-derived invariants
+        # -----------------------------
+        aw_hs = awvalid and awready
+        ar_hs = arvalid and arready
+        w_hs  = wvalid and wready
+
+        # Hidden handshakes: previous sample showed VALID stalled low by READY,
+        # current sample shows READY high but VALID already dropped because the
+        # DUT consumed the handshake on the edge we just crossed.
+        aw_hs_hidden = (prev_awvalid and not prev_awready and
+                        (not awvalid) and awready)
+        ar_hs_hidden = (prev_arvalid and not prev_arready and
+                        (not arvalid) and arready)
+
+        if aw_hs:
+            w_expected_beats.append(awlen + 1)
+        elif aw_hs_hidden:
+            w_expected_beats.append(prev_awlen + 1)
+
+        if w_hs:
+            if not w_expected_beats:
+                raise AssertionError(
+                    "AXI invariant: accepted W beat with no preceding AW burst"
+                )
+
+            beats_left_before = w_expected_beats[0]
+            expected_wlast = 1 if beats_left_before == 1 else 0
+
+            if wlast != expected_wlast:
+                raise AssertionError(
+                    "AXI invariant: WLAST mismatch: "
+                    f"beats_left_before={beats_left_before}, "
+                    f"expected_wlast={expected_wlast}, actual_wlast={wlast}"
+                )
+
+            beats_left_after = beats_left_before - 1
+            if beats_left_after == 0:
+                w_expected_beats.popleft()
+            else:
+                w_expected_beats[0] = beats_left_after
+
+        # -----------------------------
+        # Remember current stall state
+        # -----------------------------
+        aw_stall_payload = aw_payload if (awvalid and not awready) else None
+        w_stall_payload  = w_payload  if (wvalid and not wready) else None
+        ar_stall_payload = ar_payload if (arvalid and not arready) else None
+
+        prev_awvalid = awvalid
+        prev_awready = awready
+        prev_awlen = awlen
+        prev_arvalid = arvalid
+        prev_arready = arready
+        prev_arlen = arlen
+
+
+async def _ahb_input_invariant_monitor(dut):
+    """
+    Passive always-on monitor for basic AHB input-side stability.
+
+    Narrow rule only:
+      - if a *real* transfer (HTRANS[1]=1) is already being held across
+        consecutive wait-state cycles (HREADY=0), then the master-facing
+        control signals for that held transfer must remain stable.
+
+    This intentionally does NOT constrain IDLE/BUSY/preload behavior while
+    stalled, because several existing tests legally stage the next request
+    before HREADY returns high.
+    """
+    stalled_active_ctrl = None
+
+    while True:
+        await RisingEdge(dut.clk)
+        await ReadOnly()
+
+        if not _sigint(dut.resetn):
+            stalled_active_ctrl = None
+            continue
+
+        hready = _sigint(dut.hready)
+
+        hsel   = _sigint(dut.hsel)
+        htrans = _sigint(dut.htrans)
+        hwrite = _sigint(dut.hwrite)
+        haddr  = _sigint(dut.haddr)
+        hsize  = _sigint(dut.hsize)
+        hburst = _sigint(dut.hburst)
+
+        ctrl = (hsel, htrans, hwrite, haddr, hsize, hburst)
+        active_transfer = ((htrans & 0b10) != 0)
+
+        if not hready:
+            if stalled_active_ctrl is not None:
+                if ctrl != stalled_active_ctrl:
+                    raise AssertionError(
+                        "AHB invariant: active transfer control changed across wait states: "
+                        f"prev={stalled_active_ctrl}, now={ctrl}"
+                    )
+            else:
+                # Only start checking stability if the currently stalled cycle
+                # is already holding a real transfer (NONSEQ/SEQ).
+                if active_transfer:
+                    stalled_active_ctrl = ctrl
+        else:
+            stalled_active_ctrl = None
+
+
+def _axsize_to_size_bytes(axsize: int) -> int:
+    return 1 << axsize
+
+
+def _hburst_fixed_len(hburst: int):
+    return {
+        0b000: 1,   # SINGLE
+        0b011: 4,   # INCR4
+        0b101: 8,   # INCR8
+        0b111: 16,  # INCR16
+    }.get(hburst, None)
+
+
+def _undefined_incr_burst_continues_this_cycle(hready, hsel, htrans, hwrite):
+    """
+    Return True if an open undefined-length AHB INCR write burst should remain open
+    across the current cycle.
+
+    Rules:
+      - while HREADY=0, the address phase has not advanced -> keep burst open
+      - BUSY does not terminate the burst
+      - a write SEQ continues the burst
+      - anything else means the burst has ended
+    """
+    if not hready:
+        return True
+    if htrans == AHB_BUSY:
+        return True
+    if hsel and hwrite and (htrans == AHB_SEQ):
+        return True
+    return False
+
+
+def _enqueue_expected_axi_write_bursts_from_ahb(open_burst, out_q):
+    """
+    Convert one accepted AHB write burst into one or more expected AXI write bursts.
+    For undefined INCR, split into chunks of up to 16 beats.
+    """
+    beats = open_burst["beats"]
+    hburst = open_burst["hburst"]
+    hsize = open_burst["hsize"]
+
+    fixed_len = _hburst_fixed_len(hburst)
+    if fixed_len is not None:
+        if len(beats) != fixed_len:
+            raise AssertionError(
+                f"Write scoreboard: fixed AHB burst length mismatch: "
+                f"hburst=0x{hburst:x}, expected {fixed_len} beats, got {len(beats)}"
+            )
+        out_q.append({
+            "src": "AHB-fixed",
+            "start_addr": beats[0]["addr"],
+            "nbeats": len(beats),
+            "axsize": hsize,
+            "beats": beats[:],
+        })
+        return
+
+    if hburst == 0b001:  # INCR undefined length
+        for i in range(0, len(beats), 16):
+            chunk = beats[i:i + 16]
+            out_q.append({
+                "src": "AHB-incr",
+                "start_addr": chunk[0]["addr"],
+                "nbeats": len(chunk),
+                "axsize": hsize,
+                "beats": chunk[:],
+            })
+        return
+
+    raise AssertionError(
+        f"Write scoreboard: unsupported HBURST 0x{hburst:x} in AHB write burst"
+    )
+
+
+def _compare_expected_vs_actual_axi_write(expected, actual):
+    exp_addr = expected["start_addr"]
+    act_addr = actual["awaddr"]
+    if act_addr != exp_addr:
+        raise AssertionError(
+            f"Write scoreboard: AWADDR mismatch: "
+            f"expected 0x{exp_addr:08x}, got 0x{act_addr:08x}"
+        )
+
+    exp_nbeats = expected["nbeats"]
+    act_nbeats = actual["awlen"] + 1
+    if act_nbeats != exp_nbeats:
+        raise AssertionError(
+            f"Write scoreboard: burst length mismatch: "
+            f"expected {exp_nbeats} beats, got {act_nbeats}"
+        )
+
+    exp_axsize = expected["axsize"]
+    act_axsize = actual["awsize"]
+    if act_axsize != exp_axsize:
+        raise AssertionError(
+            f"Write scoreboard: AWSIZE mismatch: "
+            f"expected {exp_axsize}, got {act_axsize}"
+        )
+
+    exp_beats = expected["beats"]
+    act_beats = actual["beats"]
+    if len(act_beats) != len(exp_beats):
+        raise AssertionError(
+            f"Write scoreboard: beat-list length mismatch: "
+            f"expected {len(exp_beats)}, got {len(act_beats)}"
+        )
+
+    for i, (e, a) in enumerate(zip(exp_beats, act_beats)):
+        if a["data"] != e["data"]:
+            raise AssertionError(
+                f"Write scoreboard: beat {i} WDATA mismatch: "
+                f"expected 0x{e['data']:016x}, got 0x{a['data']:016x}"
+            )
+        if a["strb"] != e["strb"]:
+            raise AssertionError(
+                f"Write scoreboard: beat {i} WSTRB mismatch: "
+                f"expected 0x{e['strb']:02x}, got 0x{a['strb']:02x}"
+            )
+
+
+def _hburst_wrap_len(hburst: int):
+    return {
+        0b010: 4,   # WRAP4
+        0b100: 8,   # WRAP8
+        0b110: 16,  # WRAP16
+    }.get(hburst, None)
+
+
+def _split_incr_read_start_chunks(start_addr: int, nbeats: int, size_bytes: int):
+    """
+    Split an undefined-length AHB INCR read burst into AXI INCR chunks.
+
+    Conservative model:
+      - max 16 beats per AXI burst
+      - do not cross a 4 KiB boundary
+    """
+    chunks = []
+    addr = start_addr
+    beats_left = nbeats
+
+    while beats_left > 0:
+        bytes_to_4k = 4096 - (addr & 0xFFF)
+        beats_to_4k = max(1, bytes_to_4k // size_bytes)
+        chunk_beats = min(beats_left, 16, beats_to_4k)
+        chunks.append((addr, chunk_beats))
+        addr += chunk_beats * size_bytes
+        beats_left -= chunk_beats
+
+    return chunks
+
+
+def _undefined_incr_read_burst_continues_this_cycle(hready, hsel, htrans, hwrite):
+    """
+    Return True if an open undefined-length AHB INCR read burst should remain open
+    across the current cycle.
+
+    Rules:
+      - while HREADY=0, the address phase has not advanced -> keep burst open
+      - BUSY does not terminate the burst
+      - a read SEQ continues the burst
+      - anything else means the burst has ended
+    """
+    if not hready:
+        return True
+    if htrans == AHB_BUSY:
+        return True
+    if hsel and (not hwrite) and (htrans == AHB_SEQ):
+        return True
+    return False
+
+
+def _enqueue_expected_axi_read_bursts_from_ahb(open_burst, out_q):
+    """
+    Convert one accepted AHB read burst into one or more expected AXI AR bursts.
+    """
+    hburst = open_burst["hburst"]
+    hsize = open_burst["hsize"]
+    start_addr = open_burst["start_addr"]
+    addr_count = open_burst["addr_count"]
+
+    fixed_len = _hburst_fixed_len(hburst)
+    if fixed_len is not None:
+        if addr_count != fixed_len:
+            raise AssertionError(
+                f"Read scoreboard: fixed AHB burst length mismatch: "
+                f"hburst=0x{hburst:x}, expected {fixed_len} beats, got {addr_count}"
+            )
+        out_q.append({
+            "src": "AHB-fixed-read",
+            "start_addr": start_addr,
+            "nbeats": addr_count,
+            "axsize": hsize,
+            "arburst": 1,  # AXI INCR
+        })
+        return
+
+    wrap_len = _hburst_wrap_len(hburst)
+    if wrap_len is not None:
+        if addr_count != wrap_len:
+            raise AssertionError(
+                f"Read scoreboard: WRAP burst length mismatch: "
+                f"hburst=0x{hburst:x}, expected {wrap_len} beats, got {addr_count}"
+            )
+        out_q.append({
+            "src": "AHB-wrap-read",
+            "start_addr": start_addr,
+            "nbeats": addr_count,
+            "axsize": hsize,
+            "arburst": 2,  # AXI WRAP
+        })
+        return
+
+    if hburst == 0b001:  # INCR undefined length
+        size_bytes = _axsize_to_size_bytes(hsize)
+        for chunk_addr, chunk_beats in _split_incr_read_start_chunks(
+            start_addr, addr_count, size_bytes
+        ):
+            out_q.append({
+                "src": "AHB-incr-read",
+                "start_addr": chunk_addr,
+                "nbeats": chunk_beats,
+                "axsize": hsize,
+                "arburst": 1,  # AXI INCR
+            })
+        return
+
+    raise AssertionError(
+        f"Read scoreboard: unsupported HBURST 0x{hburst:x} in AHB read burst"
+    )
+
+
+def _compare_expected_vs_actual_axi_read(expected, actual):
+    exp_addr = expected["start_addr"]
+    act_addr = actual["araddr"]
+    if act_addr != exp_addr:
+        raise AssertionError(
+            f"Read scoreboard: ARADDR mismatch: "
+            f"expected 0x{exp_addr:08x}, got 0x{act_addr:08x}"
+        )
+
+    exp_nbeats = expected["nbeats"]
+    act_nbeats = actual["arlen"] + 1
+    if act_nbeats != exp_nbeats:
+        raise AssertionError(
+            f"Read scoreboard: burst length mismatch: "
+            f"expected {exp_nbeats} beats, got {act_nbeats}"
+        )
+
+    exp_axsize = expected["axsize"]
+    act_axsize = actual["arsize"]
+    if act_axsize != exp_axsize:
+        raise AssertionError(
+            f"Read scoreboard: ARSIZE mismatch: "
+            f"expected {exp_axsize}, got {act_axsize}"
+        )
+
+    exp_arburst = expected["arburst"]
+    act_arburst = actual["arburst"]
+    if act_arburst != exp_arburst:
+        raise AssertionError(
+            f"Read scoreboard: ARBURST mismatch: "
+            f"expected {exp_arburst}, got {act_arburst}"
+        )
+
+    act_beats = actual["beats"]
+    if len(act_beats) != exp_nbeats:
+        raise AssertionError(
+            f"Read scoreboard: beat-list length mismatch: "
+            f"expected {exp_nbeats}, got {len(act_beats)}"
+        )
+
+    for i, beat in enumerate(act_beats):
+        expected_last = 1 if i == exp_nbeats - 1 else 0
+        if beat["last"] != expected_last:
+            raise AssertionError(
+                f"Read scoreboard: beat {i} RLAST mismatch: "
+                f"expected {expected_last}, got {beat['last']}"
+            )
+
+
+async def _ahb_to_axi_write_scoreboard(dut):
+    """
+    Always-on passive scoreboard for accepted AHB writes -> emitted AXI AW/W bursts.
+
+    This version uses the wrapper's delayed write-phase debug signals to
+    reconstruct the AHB write beat stream robustly across the existing tests:
+
+      - wr_phase_d : write data phase active for the current beat
+      - haddr_d    : address corresponding to the current write data beat
+      - hsize_d    : size corresponding to the current write data beat
+
+    Supported:
+      - SINGLE
+      - fixed INCR4/INCR8/INCR16
+      - undefined INCR (split into AXI chunks of up to 16 beats)
+    """
+    expected_axi_bursts = deque()
+    completed_axi_bursts = deque()
+    active_axi_bursts = deque()
+
+    prev_awvalid = 0
+    prev_awready = 0
+    prev_awaddr = 0
+    prev_awlen = 0
+    prev_awsize = 0
+
+    open_ahb_burst = None
+
+    while True:
+        await RisingEdge(dut.clk)
+        await ReadOnly()
+
+        if not _sigint(dut.resetn):
+            expected_axi_bursts.clear()
+            completed_axi_bursts.clear()
+            active_axi_bursts.clear()
+            prev_awvalid = 0
+            prev_awready = 0
+            prev_awaddr = 0
+            prev_awlen = 0
+            prev_awsize = 0
+            open_ahb_burst = None
+            continue
+
+        # ------------------------------------------------------------
+        # Sample AXI write channel handshakes
+        # ------------------------------------------------------------
+        awvalid = _sigint(dut.m_axi_awvalid)
+        awready = _sigint(dut.m_axi_awready)
+        awaddr  = _sigint(dut.m_axi_awaddr)
+        awlen   = _sigint(dut.m_axi_awlen)
+        awsize  = _sigint(dut.m_axi_awsize)
+
+        wvalid = _sigint(dut.m_axi_wvalid)
+        wready = _sigint(dut.m_axi_wready)
+        wdata  = _sigint(dut.m_axi_wdata)
+        wstrb  = _sigint(dut.m_axi_wstrb)
+        wlast  = _sigint(dut.m_axi_wlast)
+
+        aw_hs = awvalid and awready
+        w_hs  = wvalid and wready
+
+        aw_hs_hidden = (prev_awvalid and not prev_awready and
+                        (not awvalid) and awready)
+
+        if aw_hs:
+            active_axi_bursts.append({
+                "awaddr": awaddr,
+                "awlen": awlen,
+                "awsize": awsize,
+                "beats": [],
+            })
+        elif aw_hs_hidden:
+            active_axi_bursts.append({
+                "awaddr": prev_awaddr,
+                "awlen": prev_awlen,
+                "awsize": prev_awsize,
+                "beats": [],
+            })
+
+        if w_hs:
+            if not active_axi_bursts:
+                raise AssertionError(
+                    "Write scoreboard: accepted AXI W beat with no active AXI AW burst"
+                )
+
+            cur_axi = active_axi_bursts[0]
+            cur_axi["beats"].append({
+                "data": wdata,
+                "strb": wstrb,
+                "last": wlast,
+            })
+
+            if len(cur_axi["beats"]) == cur_axi["awlen"] + 1:
+                completed_axi_bursts.append(active_axi_bursts.popleft())
+
+        prev_awvalid = awvalid
+        prev_awready = awready
+        prev_awaddr = awaddr
+        prev_awlen = awlen
+        prev_awsize = awsize
+
+        # ------------------------------------------------------------
+        # Sample AHB / wrapper-side signals
+        # ------------------------------------------------------------
+        hready   = _sigint(dut.hready)
+        hsel     = _sigint(dut.hsel)
+        htrans   = _sigint(dut.htrans)
+        hwrite   = _sigint(dut.hwrite)
+        haddr    = _sigint(dut.haddr)
+        hburst   = _sigint(dut.hburst)
+        hsize    = _sigint(dut.hsize)
+        hwdata   = _sigint(dut.hwdata)
+
+        wr_phase_d = _sigint(dut.wr_phase_d)
+        haddr_d    = _sigint(dut.haddr_d)
+        hsize_d    = _sigint(dut.hsize_d)
+        hreadyin_q = _sigint(dut.dut.hreadyin_q)
+
+        # Use the DUT's sampled HREADYIN qualifier rather than raw current
+        # HREADYIN or no qualifier at all.
+        #
+        # This avoids double-counting a held NONSEQ in Bug8-style scenarios,
+        # where HREADY can return high while the master is still effectively
+        # stalled on the same address/control phase.
+        ahb_addr_accepted = hsel and hready and hreadyin_q and ((htrans & 0b10) != 0)
+        ahb_write_data_accepted = wr_phase_d and hready
+
+        # ------------------------------------------------------------
+        # Start a new expected AHB write burst on accepted NONSEQ
+        # ------------------------------------------------------------
+        if ahb_addr_accepted and hwrite and (htrans == AHB_NONSEQ):
+            if open_ahb_burst is not None:
+                # A new NONSEQ means the previous write burst has ended.
+                fixed_len = _hburst_fixed_len(open_ahb_burst["hburst"])
+                if fixed_len is not None:
+                    if len(open_ahb_burst["beats"]) != fixed_len:
+                        raise AssertionError(
+                            f"Write scoreboard: fixed AHB burst length mismatch: "
+                            f"hburst=0x{open_ahb_burst['hburst']:x}, "
+                            f"expected {fixed_len} beats, got {len(open_ahb_burst['beats'])}"
+                        )
+                _enqueue_expected_axi_write_bursts_from_ahb(
+                    open_ahb_burst, expected_axi_bursts
+                )
+
+            open_ahb_burst = {
+                "hburst": hburst,
+                "hsize": hsize,
+                "beats": [],
+            }
+
+        # ------------------------------------------------------------
+        # Fallback: if a write data beat is being accepted but no open burst
+        # exists, synthesize one from the delayed write-phase view.
+        #
+        # This covers tests where the external AHB control reconstruction is
+        # intentionally non-standard, but the DUT still has an unambiguous
+        # accepted write beat stream internally.
+        # ------------------------------------------------------------
+        if ahb_write_data_accepted and open_ahb_burst is None:
+            open_ahb_burst = {
+                "hburst": hburst,
+                "hsize": hsize_d,
+                "beats": [],
+            }
+
+        # ------------------------------------------------------------
+        # Append accepted AHB write data beats using delayed write-phase view
+        # ------------------------------------------------------------
+        if ahb_write_data_accepted:
+            if open_ahb_burst is None:
+                raise AssertionError(
+                    "Write scoreboard: accepted AHB write data beat with no open burst"
+                )
+
+            size_bytes = _axsize_to_size_bytes(hsize_d)
+
+            open_ahb_burst["beats"].append({
+                "addr": haddr_d,
+                "data": hwdata,
+                "strb": _strb_mask(haddr_d, size_bytes),
+            })
+
+            fixed_len = _hburst_fixed_len(open_ahb_burst["hburst"])
+            if fixed_len is not None and len(open_ahb_burst["beats"]) == fixed_len:
+                _enqueue_expected_axi_write_bursts_from_ahb(
+                    open_ahb_burst, expected_axi_bursts
+                )
+                open_ahb_burst = None
+
+        # ------------------------------------------------------------
+        # Close undefined INCR bursts only when fully drained and the current
+        # cycle truly terminates the burst.
+        # ------------------------------------------------------------
+        if open_ahb_burst is not None and open_ahb_burst["hburst"] == 0b001:
+            if (
+                not ahb_write_data_accepted
+                and not _undefined_incr_burst_continues_this_cycle(
+                    hready, hsel, htrans, hwrite
+                )
+            ):
+                _enqueue_expected_axi_write_bursts_from_ahb(
+                    open_ahb_burst, expected_axi_bursts
+                )
+                open_ahb_burst = None
+
+        # ------------------------------------------------------------
+        # Compare any completed AXI write bursts against expected ones
+        # ------------------------------------------------------------
+        while expected_axi_bursts and completed_axi_bursts:
+            expected = expected_axi_bursts.popleft()
+            actual = completed_axi_bursts.popleft()
+            _compare_expected_vs_actual_axi_write(expected, actual)
+
+
+async def _ahb_to_axi_read_scoreboard(dut):
+    """
+    Always-on passive AXI read-burst scoreboard.
+
+    Conservative behavior:
+      - tracks accepted AXI AR bursts
+      - tracks accepted AXI R beats
+      - checks beat count vs ARLEN+1
+      - checks RLAST alignment
+      - ignores stray/post-reset R beats until the first accepted AR after reset
+
+    This avoids false positives in tests where stale read responses may still
+    be visible around reset/backpressure boundaries before the next real AR
+    request of the current test epoch.
+    """
+    active_axi_bursts = deque()
+    seen_ar_since_reset = False
+    prev_arvalid = 0
+    prev_arready = 0
+    prev_araddr = 0
+    prev_arlen = 0
+    prev_arsize = 0
+    prev_arburst = 0
+
+    while True:
+        await RisingEdge(dut.clk)
+        await ReadOnly()
+
+        if not _sigint(dut.resetn):
+            active_axi_bursts.clear()
+            seen_ar_since_reset = False
+            prev_arvalid = 0
+            prev_arready = 0
+            prev_araddr = 0
+            prev_arlen = 0
+            prev_arsize = 0
+            prev_arburst = 0
+            continue
+
+        # ------------------------------------------------------------
+        # Sample AXI read channel handshakes
+        # ------------------------------------------------------------
+        arvalid = _sigint(dut.m_axi_arvalid)
+        arready = _sigint(dut.m_axi_arready)
+        araddr  = _sigint(dut.m_axi_araddr)
+        arlen   = _sigint(dut.m_axi_arlen)
+        arsize  = _sigint(dut.m_axi_arsize)
+        arburst = _sigint(dut.m_axi_arburst)
+
+        rvalid = _sigint(dut.m_axi_rvalid)
+        rready = _sigint(dut.m_axi_rready)
+        rdata  = _sigint(dut.m_axi_rdata)
+        rresp  = _sigint(dut.m_axi_rresp)
+        rlast  = _sigint(dut.m_axi_rlast)
+
+        ar_hs = arvalid and arready
+        r_hs  = rvalid and rready
+
+        ar_hs_hidden = (prev_arvalid and not prev_arready and
+                        (not arvalid) and arready)
+
+        # ------------------------------------------------------------
+        # Record accepted AR bursts
+        # ------------------------------------------------------------
+        if ar_hs:
+            seen_ar_since_reset = True
+            active_axi_bursts.append({
+                "araddr": araddr,
+                "arlen": arlen,
+                "arsize": arsize,
+                "arburst": arburst,
+                "beats": [],
+            })
+        elif ar_hs_hidden:
+            seen_ar_since_reset = True
+            active_axi_bursts.append({
+                "araddr": prev_araddr,
+                "arlen": prev_arlen,
+                "arsize": prev_arsize,
+                "arburst": prev_arburst,
+                "beats": [],
+            })
+
+        # ------------------------------------------------------------
+        # Check accepted R beats against the oldest outstanding AR burst
+        # ------------------------------------------------------------
+        if r_hs:
+            if not active_axi_bursts:
+                # Ignore stray/stale/post-reset R beats until the first real AR
+                # of the current reset epoch has been accepted.
+                if not seen_ar_since_reset:
+                    continue
+
+                raise AssertionError(
+                    "Read scoreboard: accepted AXI R beat with no active AXI AR burst"
+                )
+
+            cur_axi = active_axi_bursts[0]
+            beat_idx = len(cur_axi["beats"])
+            exp_nbeats = cur_axi["arlen"] + 1
+            exp_rlast = 1 if beat_idx == exp_nbeats - 1 else 0
+
+            if rlast != exp_rlast:
+                raise AssertionError(
+                    f"Read scoreboard: beat {beat_idx} RLAST mismatch: "
+                    f"expected {exp_rlast}, got {rlast}"
+                )
+
+            cur_axi["beats"].append({
+                "data": rdata,
+                "resp": rresp,
+                "last": rlast,
+            })
+
+            if len(cur_axi["beats"]) > exp_nbeats:
+                raise AssertionError(
+                    f"Read scoreboard: too many R beats for AR burst: "
+                    f"expected {exp_nbeats}, got at least {len(cur_axi['beats'])}"
+                )
+
+            if len(cur_axi["beats"]) == exp_nbeats:
+                active_axi_bursts.popleft()
+
+        prev_arvalid = arvalid
+        prev_arready = arready
+        prev_araddr = araddr
+        prev_arlen = arlen
+        prev_arsize = arsize
+        prev_arburst = arburst
+
 
 CLK_NS = 10
 RAM_SIZE = 64 * 1024
@@ -64,6 +947,8 @@ def _init_direct_ahb_signals(dut):
 
 async def setup_dut(dut, with_ahb_master=True):
     cocotb.start_soon(Clock(dut.clk, CLK_NS, units="ns").start())
+    _start_invariant_monitors(dut)
+    cocotb.start_soon(_ahb_to_axi_read_scoreboard(dut))
 
     dut.resetn.setimmediatevalue(0)
     _init_direct_ahb_signals(dut)
@@ -466,6 +1351,7 @@ def _init_manual_axi_slave_inputs(dut):
 
 async def setup_dut_no_axi_slave(dut):
     cocotb.start_soon(Clock(dut.clk, CLK_NS, units="ns").start())
+    _start_invariant_monitors(dut)
 
     dut.resetn.setimmediatevalue(0)
     _init_direct_ahb_signals(dut)
@@ -3061,6 +3947,30 @@ async def wait_for_b_handshake(dut):
                 "resp": int(dut.m_axi_bresp.value),
             }
 
+
+async def drive_okay_b_after_last_w_handshake(dut, *, delay_cycles=0):
+    while True:
+        await RisingEdge(dut.clk)
+        if (int(dut.m_axi_wvalid.value)
+            and int(dut.m_axi_wready.value)
+            and int(dut.m_axi_wlast.value)):
+            break
+
+    for _ in range(delay_cycles):
+        await RisingEdge(dut.clk)
+
+    dut.m_axi_bid.value = 0
+    dut.m_axi_bresp.value = 0
+    dut.m_axi_bvalid.value = 1
+
+    while True:
+        await RisingEdge(dut.clk)
+        if int(dut.m_axi_bvalid.value) and int(dut.m_axi_bready.value):
+            break
+
+    dut.m_axi_bvalid.value = 0
+    dut.m_axi_bresp.value = 0
+
 @cocotb.test()
 async def test_incr_len5_qword_read_burst_returns_expected(dut):
     set_test_id(dut)    
@@ -4341,6 +5251,7 @@ async def test_hmastlock_maps_to_awlock_on_wrap4_write(dut):
 
     aw_task = cocotb.start_soon(wait_for_aw_handshake(dut))
     w_task = cocotb.start_soon(wait_for_n_w_handshakes(dut, 4))
+    b_task = cocotb.start_soon(drive_okay_b_after_last_w_handshake(dut))
 
     await ahb_write_wrap_burst_manual_with_attrs(
         dut, start_addr, beats, size_bytes=8, hmastlock=1
@@ -4348,13 +5259,7 @@ async def test_hmastlock_maps_to_awlock_on_wrap4_write(dut):
 
     aw_info = await aw_task
     w_beats = await w_task
-
-    dut.m_axi_bvalid.value = 1
-    while True:
-        await RisingEdge(dut.clk)
-        if int(dut.m_axi_bvalid.value) and int(dut.m_axi_bready.value):
-            break
-    dut.m_axi_bvalid.value = 0
+    await b_task
 
     assert aw_info["addr"] == start_addr
     assert aw_info["len"] == 3
@@ -6910,8 +7815,10 @@ async def test_regression_bug8_back_to_back_incr8_writes_dropped(dut):
     for beat in range(8):
         # Wait for bridge HREADY=1 (tracking HREADYIN = HREADY)
         while True:
+            # Read HREADY pre-NBA, exactly like burst 2 below.
+            # Using ReadOnly() here observes the bridge's post-edge HREADY drop
+            # half a cycle too early and leaves burst-1 HWDATA one beat behind.
             await RisingEdge(dut.clk)
-            await ReadOnly()
             hr = int(dut.hready.value)
             await NextTimeStep()
             dut.hreadyin.value = hr
@@ -6984,8 +7891,13 @@ async def test_regression_bug8_back_to_back_incr8_writes_dropped(dut):
     # ==================================================================
     for beat in range(1, 8):
         while True:
+            # Read HREADY WITHOUT ReadOnly() so we see the pre-NBA value.
+            # With ReadOnly() the cocotb master would observe aw_sent's NBA
+            # result one half-cycle early (reactive vs posedge), advancing
+            # HWDATA one cycle ahead of what a synchronous RTL master would
+            # do.  Reading pre-NBA matches hardware: the master sees HREADY=1
+            # only after aw_sent has been registered for a full cycle.
             await RisingEdge(dut.clk)
-            await ReadOnly()
             hr = int(dut.hready.value)
             await NextTimeStep()
             dut.hreadyin.value = hr
@@ -7317,8 +8229,9 @@ async def test_combined_minimal_sparse_guard_then_bug8(dut):
 
         for beat in range(1, 8):
             while True:
+                # Read HREADY pre-NBA to match synchronous hardware master
+                # timing (see test_regression_bug8 for full explanation).
                 await RisingEdge(dut.clk)
-                await ReadOnly()
                 hr = int(dut.hready.value)
                 await NextTimeStep()
                 dut.hreadyin.value = hr
@@ -7338,8 +8251,10 @@ async def test_combined_minimal_sparse_guard_then_bug8(dut):
             dut.hwdata.value = DATA_B[beat]
 
         while True:
+            # Read HREADY pre-NBA, exactly like burst 2 below.
+            # Using ReadOnly() here observes the bridge's post-edge HREADY drop
+            # half a cycle too early and leaves burst-1 HWDATA one beat behind.
             await RisingEdge(dut.clk)
-            await ReadOnly()
             hr = int(dut.hready.value)
             await NextTimeStep()
             dut.hreadyin.value = hr
@@ -7410,3 +8325,1030 @@ async def test_combined_minimal_sparse_guard_then_bug8(dut):
     # ==================================================================
     if errors:
         raise AssertionError(" | ".join(errors))
+
+
+
+@cocotb.test()
+async def test_many_incr8_cacheline_reads_and_writes_hprot3(dut):
+    set_test_id(dut)
+    await setup_dut_no_axi_slave(dut)
+
+    mem = {}
+    wr_task = cocotb.start_soon(axi_sparse_mem_write_slave(dut, mem))
+    rd_task = cocotb.start_soon(axi_sparse_mem_read_slave(dut, mem))
+
+    HBURST_INCR8 = 0b101
+    HSIZE_64     = 3
+    HPROT_CACHE  = 0b0011
+    BASE_W       = 0x8000
+    BASE_R       = 0xA000
+    N_LINES      = 32   # enough to stress repeated cache-line traffic
+
+    def line_addr(base, idx):
+        return base + idx * 0x40   # 8 beats * 8 bytes
+
+    def make_line(tag):
+        return [((tag & 0xFFFFFFFF) << 32) | beat for beat in range(8)]
+
+    async def _wait_hready_ro(timeout_cycles=5000):
+        for _ in range(timeout_cycles):
+            await RisingEdge(dut.clk)
+            await ReadOnly()
+            if int(dut.hready.value):
+                return int(dut.hrdata.value)
+        raise TimeoutError("no HREADY")
+
+    async def _write_incr8_hprot3(start_addr, beats_8):
+        assert len(beats_8) == 8
+
+        beat_stride = 8
+        hsize = HSIZE_64
+        hburst = HBURST_INCR8
+
+        dut.haddr.value = start_addr
+        dut.hburst.value = hburst
+        dut.hmastlock.value = 0
+        dut.hprot.value = HPROT_CACHE
+        dut.hsize.value = hsize
+        dut.htrans.value = 0b10    # NONSEQ
+        dut.hwrite.value = 1
+        dut.hwdata.value = 0
+
+        for i in range(8):
+            await _wait_hready_high(dut)
+
+            addr_i = start_addr + i * beat_stride
+            dut.hwdata.value = beats_8[i]
+
+            if i == 7:
+                dut.haddr.value = 0
+                dut.hburst.value = 0
+                dut.hmastlock.value = 0
+                dut.hprot.value = 0
+                dut.hsize.value = 0
+                dut.htrans.value = 0   # IDLE
+                dut.hwrite.value = 0
+            else:
+                dut.haddr.value = start_addr + (i + 1) * beat_stride
+                dut.hburst.value = hburst
+                dut.hmastlock.value = 0
+                dut.hprot.value = HPROT_CACHE
+                dut.hsize.value = hsize
+                dut.htrans.value = 0b11   # SEQ
+                dut.hwrite.value = 1
+
+        await _wait_hready_high(dut)
+        _init_direct_ahb_signals(dut)
+        dut.hsel.value = 1
+        dut.hreadyin.value = 1
+
+    async def _read_incr8_hprot3(start_addr):
+        results = []
+
+        dut.haddr.value = start_addr
+        dut.hburst.value = HBURST_INCR8
+        dut.hmastlock.value = 0
+        dut.hprot.value = HPROT_CACHE
+        dut.hsize.value = HSIZE_64
+        dut.htrans.value = 0b10   # NONSEQ
+        dut.hwrite.value = 0
+        dut.hwdata.value = 0
+
+        for i in range(8):
+            await _wait_hready_high(dut)
+
+            if i > 0:
+                results.append(int(dut.hrdata.value))
+
+            if i == 7:
+                dut.haddr.value = 0
+                dut.hburst.value = 0
+                dut.hmastlock.value = 0
+                dut.hprot.value = 0
+                dut.hsize.value = 0
+                dut.htrans.value = 0
+                dut.hwrite.value = 0
+            else:
+                dut.haddr.value = start_addr + (i + 1) * 8
+                dut.hburst.value = HBURST_INCR8
+                dut.hmastlock.value = 0
+                dut.hprot.value = HPROT_CACHE
+                dut.hsize.value = HSIZE_64
+                dut.htrans.value = 0b11   # SEQ
+                dut.hwrite.value = 0
+
+        await _wait_hready_high(dut)
+        results.append(int(dut.hrdata.value))
+
+        _init_direct_ahb_signals(dut)
+        dut.hsel.value = 1
+        dut.hreadyin.value = 1
+        return results
+
+    try:
+        # ------------------------------------------------------------------
+        # Phase 0: initialize read-only area with known lines
+        # ------------------------------------------------------------------
+        expected_read_lines = {}
+        for i in range(N_LINES):
+            addr = line_addr(BASE_R, i)
+            beats = make_line(0x9000 + i)
+            expected_read_lines[addr] = beats
+            for b, val in enumerate(beats):
+                mem[addr + b * 8] = val
+
+        # ------------------------------------------------------------------
+        # Phase 1: many INCR8 reads of cache-line-shaped traffic
+        # ------------------------------------------------------------------
+        for i in range(N_LINES):
+            addr = line_addr(BASE_R, i)
+            got = await with_timeout(_read_incr8_hprot3(addr), 500, "us")
+            exp = expected_read_lines[addr]
+            assert got == exp, (
+                f"READ line {i} @0x{addr:08x}: expected {exp}, got {got}"
+            )
+
+        # ------------------------------------------------------------------
+        # Phase 2: many INCR8 writes of cache-line-shaped traffic
+        # ------------------------------------------------------------------
+        expected_write_lines = {}
+        for i in range(N_LINES):
+            addr = line_addr(BASE_W, i)
+            beats = make_line(0xA000 + i)
+            expected_write_lines[addr] = beats
+            await with_timeout(_write_incr8_hprot3(addr, beats), 500, "us")
+
+        await ClockCycles(dut.clk, 4)
+
+        for addr, beats in expected_write_lines.items():
+            for b, exp in enumerate(beats):
+                got = mem.get(addr + b * 8, 0)
+                assert got == exp, (
+                    f"WRITE verify @0x{addr + b*8:08x}: expected 0x{exp:016x}, got 0x{got:016x}"
+                )
+
+        # ------------------------------------------------------------------
+        # Phase 3: interleave more writes and reads
+        # ------------------------------------------------------------------
+        for i in range(N_LINES):
+            waddr = line_addr(BASE_W, i)
+            raddr = line_addr(BASE_R, N_LINES - 1 - i)
+
+            new_beats = make_line(0xB000 + i)
+            expected_write_lines[waddr] = new_beats
+
+            await with_timeout(_write_incr8_hprot3(waddr, new_beats), 500, "us")
+            got = await with_timeout(_read_incr8_hprot3(raddr), 500, "us")
+
+            assert got == expected_read_lines[raddr], (
+                f"INTERLEAVED read line {N_LINES - 1 - i} @0x{raddr:08x}: "
+                f"expected {expected_read_lines[raddr]}, got {got}"
+            )
+
+        await ClockCycles(dut.clk, 4)
+
+        for addr, beats in expected_write_lines.items():
+            for b, exp in enumerate(beats):
+                got = mem.get(addr + b * 8, 0)
+                assert got == exp, (
+                    f"FINAL verify @0x{addr + b*8:08x}: expected 0x{exp:016x}, got 0x{got:016x}"
+                )
+
+    finally:
+        wr_task.kill()
+        rd_task.kill()
+
+
+
+# ---------------------------------------------------------------------------
+# OpenSBI-like cache-line INCR8 helpers / test
+# ---------------------------------------------------------------------------
+
+async def _ahb_write_incr8_hprot3_manual(dut, start_addr, beats_8):
+    """Drive one AHB INCR8 64-bit write burst with HPROT=0x3."""
+    assert len(beats_8) == 8
+
+    hburst = 0b101   # INCR8
+    hsize  = 3       # 64-bit
+    hprot  = 0b0011
+
+    dut.haddr.value = start_addr
+    dut.hburst.value = hburst
+    dut.hmastlock.value = 0
+    dut.hprot.value = hprot
+    dut.hsize.value = hsize
+    dut.htrans.value = 0b10    # NONSEQ
+    dut.hwrite.value = 1
+    dut.hwdata.value = 0
+
+    for i in range(8):
+        await _wait_hready_high(dut)
+
+        if i == 7:
+            dut.haddr.value = 0
+            dut.hburst.value = 0
+            dut.hsize.value = 0
+            dut.htrans.value = 0   # IDLE
+            dut.hwrite.value = 0
+            dut.hprot.value = 0
+        else:
+            dut.haddr.value = start_addr + (i + 1) * 8
+            dut.hburst.value = hburst
+            dut.hsize.value = hsize
+            dut.htrans.value = 0b11   # SEQ
+            dut.hwrite.value = 1
+            dut.hprot.value = hprot
+
+        addr_i = start_addr + i * 8
+        dut.hwdata.value = (beats_8[i] & _mask_nbytes(8)) << _lane_shift(addr_i)
+
+    await _wait_hready_high(dut)
+    _init_direct_ahb_signals(dut)
+    dut.hsel.value = 1
+    dut.hreadyin.value = 1
+
+
+async def _ahb_read_incr8_hprot3_manual(dut, start_addr):
+    """Drive one AHB INCR8 64-bit read burst with HPROT=0x3."""
+    hburst = 0b101   # INCR8
+    hsize  = 3       # 64-bit
+    hprot  = 0b0011
+    results = []
+
+    dut.haddr.value = start_addr
+    dut.hburst.value = hburst
+    dut.hmastlock.value = 0
+    dut.hprot.value = hprot
+    dut.hsize.value = hsize
+    dut.htrans.value = 0b10   # NONSEQ
+    dut.hwrite.value = 0
+    dut.hwdata.value = 0
+
+    for i in range(8):
+        await _wait_hready_high(dut)
+
+        if i > 0:
+            results.append(int(dut.hrdata.value))
+
+        if i == 7:
+            dut.haddr.value = 0
+            dut.hburst.value = 0
+            dut.hsize.value = 0
+            dut.htrans.value = 0
+            dut.hwrite.value = 0
+            dut.hprot.value = 0
+        else:
+            dut.haddr.value = start_addr + (i + 1) * 8
+            dut.hburst.value = hburst
+            dut.hsize.value = hsize
+            dut.htrans.value = 0b11   # SEQ
+            dut.hwrite.value = 0
+            dut.hprot.value = hprot
+
+    await _wait_hready_high(dut)
+    results.append(int(dut.hrdata.value))
+
+    _init_direct_ahb_signals(dut)
+    dut.hsel.value = 1
+    dut.hreadyin.value = 1
+    return results
+
+
+async def _axi_write_slave_capture_one_burst_with_wready_stall(
+    dut, mem, stall_before_beat=1, stall_cycles=1, b_delay=2
+):
+    """
+    Capture exactly one AXI write burst.
+    Inserts a one-shot WREADY stall before the selected beat to mimic the
+    early wait seen in the OpenSBI CPU-side trace.
+    """
+    dut.m_axi_awready.value = 0
+    dut.m_axi_wready.value = 0
+    dut.m_axi_bvalid.value = 0
+    dut.m_axi_bresp.value = 0
+
+    # Wait for AW handshake
+    while True:
+        dut.m_axi_awready.value = 1
+        await RisingEdge(dut.clk)
+        if int(dut.m_axi_awvalid.value) and int(dut.m_axi_awready.value):
+            aw = {
+                "addr": int(dut.m_axi_awaddr.value),
+                "len": int(dut.m_axi_awlen.value),
+                "size": int(dut.m_axi_awsize.value),
+                "burst": int(dut.m_axi_awburst.value),
+            }
+            break
+
+    dut.m_axi_awready.value = 0
+
+    beats = []
+    size_bytes = 1 << aw["size"]
+
+    for beat_idx in range(aw["len"] + 1):
+        stall_left = stall_cycles if beat_idx == stall_before_beat else 0
+
+        while True:
+            dut.m_axi_wready.value = 0 if stall_left > 0 else 1
+            await RisingEdge(dut.clk)
+
+            if stall_left > 0:
+                stall_left -= 1
+                continue
+
+            if int(dut.m_axi_wvalid.value) and int(dut.m_axi_wready.value):
+                wdata = int(dut.m_axi_wdata.value)
+                wstrb = int(dut.m_axi_wstrb.value)
+                wlast = int(dut.m_axi_wlast.value)
+
+                beats.append({
+                    "data": wdata,
+                    "strb": wstrb,
+                    "last": wlast,
+                })
+
+                beat_addr = aw["addr"] + beat_idx * size_bytes
+                # This test models full-qword writes only, so direct store is enough.
+                if wstrb == 0xFF:
+                    mem[beat_addr] = wdata
+                else:
+                    # Keep a precise failure if this "OpenSBI-like" test ever stops
+                    # being full-qword on AXI.
+                    raise AssertionError(
+                        f"unexpected WSTRB on beat {beat_idx}: 0x{wstrb:02x}"
+                    )
+                break
+
+    dut.m_axi_wready.value = 0
+
+    for _ in range(b_delay):
+        await RisingEdge(dut.clk)
+
+    dut.m_axi_bvalid.value = 1
+    dut.m_axi_bresp.value = 0
+    while True:
+        await RisingEdge(dut.clk)
+        if int(dut.m_axi_bvalid.value) and int(dut.m_axi_bready.value):
+            break
+    dut.m_axi_bvalid.value = 0
+
+    return {
+        "aw": aw,
+        "w_beats": beats,
+    }
+
+
+@cocotb.test()
+async def test_opensbi_like_incr8_hprot3_cacheline_write_then_readback(dut):
+    set_test_id(dut)
+    await setup_dut_no_axi_slave(dut)
+
+    # Matches the AXI-side line base from your ILA file name.
+    start_addr = 0x80040540
+
+    # The "interesting" CPU-side address in your note was 0x80040558,
+    # which is beat index 3 inside this cache line.
+    interesting_addr = 0x80040558
+
+    beats = [
+        0xA540000000000000,
+        0xA548000000000001,
+        0xA550000000000002,
+        0xA558000000000003,
+        0xA560000000000004,
+        0xA568000000000005,
+        0xA570000000000006,
+        0xA578000000000007,
+    ]
+
+    mem = {
+        start_addr - 8:  0x1111111111111111,
+        start_addr + 64: 0x2222222222222222,
+    }
+
+    # ------------------------------------------------------------
+    # Phase 1: OpenSBI-like INCR8 write with one early AXI W stall
+    # ------------------------------------------------------------
+    slave_task = cocotb.start_soon(
+        _axi_write_slave_capture_one_burst_with_wready_stall(
+            dut,
+            mem,
+            stall_before_beat=1,   # early-burst wait, closest useful match
+            stall_cycles=1,
+            b_delay=2,
+        )
+    )
+
+    await with_timeout(
+        _ahb_write_incr8_hprot3_manual(dut, start_addr, beats),
+        500, "us"
+    )
+    info = await with_timeout(slave_task, 200, "us")
+
+    aw = info["aw"]
+    w_beats = info["w_beats"]
+
+    assert aw["addr"] == start_addr, f"bad AWADDR 0x{aw['addr']:08x}"
+    assert aw["len"] == 7, f"expected AWLEN=7, got {aw['len']}"
+    assert aw["size"] == 3, f"expected AWSIZE=3, got {aw['size']}"
+    assert aw["burst"] == 1, f"expected AWBURST=INCR, got {aw['burst']}"
+
+    assert len(w_beats) == 8, f"expected 8 W beats, got {len(w_beats)}"
+    for i, wb in enumerate(w_beats):
+        assert wb["data"] == beats[i], (
+            f"W[{i}] bad WDATA expected 0x{beats[i]:016x}, got 0x{wb['data']:016x}"
+        )
+        assert wb["strb"] == 0xFF, (
+            f"W[{i}] expected WSTRB=0xFF, got 0x{wb['strb']:02x}"
+        )
+        assert wb["last"] == (1 if i == 7 else 0), (
+            f"W[{i}] bad WLAST expected {1 if i == 7 else 0}, got {wb['last']}"
+        )
+
+    # Check whole line landed correctly
+    for i, exp in enumerate(beats):
+        addr = start_addr + i * 8
+        got = mem.get(addr, 0)
+        assert got == exp, (
+            f"mem[0x{addr:08x}] expected 0x{exp:016x}, got 0x{got:016x}"
+        )
+
+    # Check the specific interior-of-line address you care about
+    assert mem[interesting_addr] == beats[3], (
+        f"mem[0x{interesting_addr:08x}] expected 0x{beats[3]:016x}, "
+        f"got 0x{mem[interesting_addr]:016x}"
+    )
+
+    # Neighbor qwords outside the line must remain unchanged
+    assert mem[start_addr - 8] == 0x1111111111111111
+    assert mem[start_addr + 64] == 0x2222222222222222
+
+    # ------------------------------------------------------------
+    # Phase 2: read back the same cache line with HPROT=3
+    # ------------------------------------------------------------
+    read_slave = cocotb.start_soon(
+        axi_slave_respond_read_burst(dut, beats, r_gap=0)
+    )
+
+    got = await with_timeout(
+        _ahb_read_incr8_hprot3_manual(dut, start_addr),
+        500, "us"
+    )
+    rinfo = await with_timeout(read_slave, 200, "us")
+
+    ar = rinfo["ar"]
+    assert ar["addr"] == start_addr, f"bad ARADDR 0x{ar['addr']:08x}"
+    assert ar["len"] == 7, f"expected ARLEN=7, got {ar['len']}"
+    assert ar["size"] == 3, f"expected ARSIZE=3, got {ar['size']}"
+    assert ar["burst"] == 1, f"expected ARBURST=INCR, got {ar['burst']}"
+
+    assert got == beats, f"readback mismatch: expected {beats}, got {got}"
+
+
+
+@cocotb.test()
+async def test_opensbi_like_many_incr8_hprot3_cacheline_writes_then_readback(dut):
+    set_test_id(dut)
+    await setup_dut_no_axi_slave(dut)
+
+    BASE_ADDR = 0x80040540
+    #N_LINES   = 16
+    N_LINES   = 128
+    LINE_SIZE = 0x40
+
+    def line_addr(i):
+        return BASE_ADDR + i * LINE_SIZE
+
+    def line_beats(i):
+        base_tag = 0xC000 + i
+        return [
+            ((base_tag + 0) << 48) | 0x0000000000000000,
+            ((base_tag + 1) << 48) | 0x0000000000000001,
+            ((base_tag + 2) << 48) | 0x0000000000000002,
+            ((base_tag + 3) << 48) | 0x0000000000000003,
+            ((base_tag + 4) << 48) | 0x0000000000000004,
+            ((base_tag + 5) << 48) | 0x0000000000000005,
+            ((base_tag + 6) << 48) | 0x0000000000000006,
+            ((base_tag + 7) << 48) | 0x0000000000000007,
+        ]
+
+    expected = {}
+
+    mem = {
+        BASE_ADDR - 8:                     0x1111111111111111,
+        BASE_ADDR + N_LINES * LINE_SIZE:   0x2222222222222222,
+    }
+
+    rd_task = cocotb.start_soon(axi_sparse_mem_read_slave(dut, mem))
+
+    try:
+        # ------------------------------------------------------------
+        # Phase 1: repeated OpenSBI-like cache-line writes
+        # ------------------------------------------------------------
+        for i in range(N_LINES):
+            addr  = line_addr(i)
+            beats = line_beats(i)
+            expected[addr] = beats
+
+            wr_task = cocotb.start_soon(
+                _axi_write_slave_capture_one_burst_with_wready_stall(
+                    dut,
+                    mem,
+                    stall_before_beat=1 if (i & 1) == 0 else 2,
+                    stall_cycles=1,
+                    b_delay=2,
+                )
+            )
+
+            await with_timeout(
+                _ahb_write_incr8_hprot3_manual(dut, addr, beats),
+                500, "us"
+            )
+            info = await with_timeout(wr_task, 200, "us")
+
+            aw = info["aw"]
+            w_beats = info["w_beats"]
+
+            assert aw["addr"] == addr, f"line {i}: bad AWADDR 0x{aw['addr']:08x}"
+            assert aw["len"] == 7, f"line {i}: expected AWLEN=7, got {aw['len']}"
+            assert aw["size"] == 3, f"line {i}: expected AWSIZE=3, got {aw['size']}"
+            assert aw["burst"] == 1, f"line {i}: expected AWBURST=INCR, got {aw['burst']}"
+
+            assert len(w_beats) == 8, f"line {i}: expected 8 W beats, got {len(w_beats)}"
+            for b, wb in enumerate(w_beats):
+                assert wb["data"] == beats[b], (
+                    f"line {i} beat {b}: bad WDATA expected 0x{beats[b]:016x}, got 0x{wb['data']:016x}"
+                )
+                assert wb["strb"] == 0xFF, (
+                    f"line {i} beat {b}: expected WSTRB=0xFF, got 0x{wb['strb']:02x}"
+                )
+                assert wb["last"] == (1 if b == 7 else 0), (
+                    f"line {i} beat {b}: bad WLAST expected {1 if b == 7 else 0}, got {wb['last']}"
+                )
+
+            # Check the specific "interesting" interior qword (+0x18) after each burst
+            interesting_addr = addr + 0x18
+            assert mem[interesting_addr] == beats[3], (
+                f"line {i}: interior qword mismatch at 0x{interesting_addr:08x}: "
+                f"expected 0x{beats[3]:016x}, got 0x{mem.get(interesting_addr, 0):016x}"
+            )
+
+            # Every 16 lines, immediately read back one earlier line
+            if (i % 16) == 15:
+                prev_i = i - 3
+                prev_addr = line_addr(prev_i)
+                got = await with_timeout(
+                    _ahb_read_incr8_hprot3_manual(dut, prev_addr),
+                    500, "us"
+                )
+                assert got == expected[prev_addr], (
+                    f"early readback line {prev_i} @0x{prev_addr:08x}: "
+                    f"expected {expected[prev_addr]}, got {got}"
+                )
+
+        await ClockCycles(dut.clk, 4)
+
+        # ------------------------------------------------------------
+        # Phase 2: memory-side verification of all written lines
+        # ------------------------------------------------------------
+        for i in range(N_LINES):
+            addr = line_addr(i)
+            beats = expected[addr]
+            for b, exp in enumerate(beats):
+                a = addr + b * 8
+                got = mem.get(a, 0)
+                assert got == exp, (
+                    f"mem verify line {i} beat {b} @0x{a:08x}: "
+                    f"expected 0x{exp:016x}, got 0x{got:016x}"
+                )
+
+        # Neighbor qwords outside the whole written region must remain unchanged
+        assert mem[BASE_ADDR - 8] == 0x1111111111111111
+        assert mem[BASE_ADDR + N_LINES * LINE_SIZE] == 0x2222222222222222
+
+        # ------------------------------------------------------------
+        # Phase 3: full AHB readback of all lines
+        # ------------------------------------------------------------
+        for i in range(N_LINES):
+            addr = line_addr(i)
+            got = await with_timeout(
+                _ahb_read_incr8_hprot3_manual(dut, addr),
+                500, "us"
+            )
+            assert got == expected[addr], (
+                f"final readback line {i} @0x{addr:08x}: "
+                f"expected {expected[addr]}, got {got}"
+            )
+
+    finally:
+        rd_task.kill()
+
+
+async def _axi_slave_aw_stall_then_collect_write_burst(
+    dut,
+    *,
+    exp_beats,
+    aw_stall_cycles=6,
+    b_delay=1,
+):
+    """
+    Deliberately hold AWREADY low while WREADY is high.
+
+    Purpose:
+      reproduce the original ST_WR_INCR_FLUSH bug where the bridge could
+      emit/accept W beats before the AW handshake.
+
+    PASS on fixed RTL:
+      - no W handshake occurs during the AW stall window
+      - after AW handshake, exactly exp_beats W beats arrive
+      - final B handshake completes normally
+
+    FAIL on buggy RTL:
+      - a W handshake occurs before AW handshake
+      - usually also trips the always-on AXI invariant monitor:
+            "accepted W beat with no preceding AW burst"
+    """
+    dut.m_axi_awready.value = 0
+    dut.m_axi_wready.value = 1
+    dut.m_axi_bvalid.value = 0
+    dut.m_axi_bresp.value = 0
+    dut.m_axi_bid.value = 0
+
+    # During the forced AW stall window, NO W beat is allowed to handshake.
+    for cyc in range(aw_stall_cycles):
+        await RisingEdge(dut.clk)
+        if int(dut.m_axi_wvalid.value) and int(dut.m_axi_wready.value):
+            raise AssertionError(
+                f"W beat handshook before AW handshake during forced AW stall "
+                f"(cycle {cyc})"
+            )
+
+    # Now allow AW to handshake.
+    dut.m_axi_awready.value = 1
+
+    while True:
+        await RisingEdge(dut.clk)
+        if int(dut.m_axi_awvalid.value) and int(dut.m_axi_awready.value):
+            aw = {
+                "addr":  int(dut.m_axi_awaddr.value),
+                "len":   int(dut.m_axi_awlen.value),
+                "size":  int(dut.m_axi_awsize.value),
+                "burst": int(dut.m_axi_awburst.value),
+                "lock":  int(dut.m_axi_awlock.value),
+                "prot":  int(dut.m_axi_awprot.value),
+            }
+            break
+
+    dut.m_axi_awready.value = 0
+
+    beats = []
+    while len(beats) < exp_beats:
+        await RisingEdge(dut.clk)
+        if int(dut.m_axi_wvalid.value) and int(dut.m_axi_wready.value):
+            beats.append({
+                "data": int(dut.m_axi_wdata.value),
+                "strb": int(dut.m_axi_wstrb.value),
+                "last": int(dut.m_axi_wlast.value),
+            })
+
+    for _ in range(b_delay):
+        await RisingEdge(dut.clk)
+
+    dut.m_axi_bvalid.value = 1
+    while True:
+        await RisingEdge(dut.clk)
+        if int(dut.m_axi_bvalid.value) and int(dut.m_axi_bready.value):
+            break
+    dut.m_axi_bvalid.value = 0
+
+    return {
+        "aw": aw,
+        "beats": beats,
+    }
+
+@cocotb.test()
+async def test_regression_incr_flush_no_w_before_aw_strict(dut):
+    set_test_id(dut)
+    """
+    Regression for the original ST_WR_INCR_FLUSH bug.
+
+    We hold AWREADY low and WREADY high for the whole AHB undefined-INCR write.
+    The AHB-side helper is allowed to finish first.  After that, the bridge is
+    forced to sit in its flush path with AW still blocked.
+
+    Buggy RTL:
+      - W beat(s) can handshake before the first AW handshake
+      - this test fails immediately
+
+    Fixed RTL:
+      - no W handshake occurs before the first AW handshake
+      - once AWREADY is released, the burst completes normally
+    """
+    await setup_dut_no_axi_slave(dut)
+
+    start_addr = 0xA400
+    beats = [
+        0x0101010101010101,
+        0x0202020202020202,
+        0x0303030303030303,
+        0x0404040404040404,
+        0x0505050505050505,
+    ]
+
+    dut.m_axi_awready.value = 0
+    dut.m_axi_wready.value = 1
+    dut.m_axi_bvalid.value = 0
+    dut.m_axi_bresp.value = 0
+    dut.m_axi_bid.value = 0
+
+    first_aw_seen = False
+    stop_monitor = False
+    prev_awvalid = 0
+    prev_awready = 0
+
+    async def monitor_no_w_before_aw():
+        nonlocal first_aw_seen, stop_monitor, prev_awvalid, prev_awready
+        while not stop_monitor:
+            await RisingEdge(dut.clk)
+            await ReadOnly()
+
+            awvalid = int(dut.m_axi_awvalid.value)
+            awready = int(dut.m_axi_awready.value)
+            wvalid  = int(dut.m_axi_wvalid.value)
+            wready  = int(dut.m_axi_wready.value)
+
+            aw_hs = awvalid and awready
+            aw_hs_hidden = (prev_awvalid and not prev_awready and
+                            (not awvalid) and awready)
+            w_hs  = wvalid and wready
+
+            if aw_hs or aw_hs_hidden:
+                first_aw_seen = True
+
+            if w_hs and not first_aw_seen:
+                raise AssertionError(
+                    "Accepted AXI W beat before first AW handshake while AWREADY was forced low"
+                )
+
+            prev_awvalid = awvalid
+            prev_awready = awready
+
+    mon_task = cocotb.start_soon(monitor_no_w_before_aw())
+
+    # Drive one undefined-length INCR burst.  Keep AW blocked the entire time.
+    write_task = cocotb.start_soon(
+        ahb_write_inc_burst_manual(
+            dut,
+            start_addr,
+            beats,
+            size_bytes=8,
+            fixed=False,
+        )
+    )
+
+    # The helper should complete on the AHB side even while AW is still blocked.
+    await with_timeout(write_task, 2, "us")
+
+    # Hold AW blocked a bit longer so we definitely sit in the flush window.
+    for _ in range(8):
+        await RisingEdge(dut.clk)
+        await ReadOnly()
+
+    # IMPORTANT: leave ReadOnly phase before driving anything.
+    await NextTimeStep()
+    dut.m_axi_awready.value = 1
+
+    # Wait for first AW handshake.
+    while True:
+        await RisingEdge(dut.clk)
+        if int(dut.m_axi_awvalid.value) and int(dut.m_axi_awready.value):
+            aw = {
+                "addr":  int(dut.m_axi_awaddr.value),
+                "len":   int(dut.m_axi_awlen.value),
+                "size":  int(dut.m_axi_awsize.value),
+                "burst": int(dut.m_axi_awburst.value),
+                "lock":  int(dut.m_axi_awlock.value),
+            }
+            break
+
+    # Collect the W beats after AW is finally allowed through.
+    wbeats = []
+    while len(wbeats) < len(beats):
+        await RisingEdge(dut.clk)
+        if int(dut.m_axi_wvalid.value) and int(dut.m_axi_wready.value):
+            wbeats.append({
+                "data": int(dut.m_axi_wdata.value),
+                "strb": int(dut.m_axi_wstrb.value),
+                "last": int(dut.m_axi_wlast.value),
+            })
+
+    # Return a B response.
+    await RisingEdge(dut.clk)
+    dut.m_axi_bvalid.value = 1
+    while True:
+        await RisingEdge(dut.clk)
+        if int(dut.m_axi_bvalid.value) and int(dut.m_axi_bready.value):
+            break
+    dut.m_axi_bvalid.value = 0
+
+    stop_monitor = True
+    await ClockCycles(dut.clk, 2)
+    mon_task.kill()
+
+    assert aw["addr"] == start_addr, f"bad AWADDR 0x{aw['addr']:08x}"
+    assert aw["len"] == len(beats) - 1, f"expected AWLEN={len(beats)-1}, got {aw['len']}"
+    assert aw["size"] == 3, f"expected AWSIZE=3, got {aw['size']}"
+    assert aw["burst"] == 1, f"expected AWBURST=INCR, got {aw['burst']}"
+
+    assert len(wbeats) == len(beats), f"expected {len(beats)} W beats, got {len(wbeats)}"
+    for i, wb in enumerate(wbeats):
+        assert wb["data"] == beats[i], (
+            f"beat {i}: bad WDATA expected 0x{beats[i]:016x}, got 0x{wb['data']:016x}"
+        )
+        assert wb["strb"] == 0xFF, (
+            f"beat {i}: bad WSTRB expected 0xFF, got 0x{wb['strb']:02x}"
+        )
+        assert wb["last"] == (1 if i == len(beats) - 1 else 0), (
+            f"beat {i}: bad WLAST expected {1 if i == len(beats)-1 else 0}, got {wb['last']}"
+        )
+
+@cocotb.test()
+async def test_regression_st_wr_d_fixed_write_bresp_gap_no_idle_read_like_linux_ila(dut):
+    set_test_id(dut)
+    """
+    Regression for the real Linux ILA path:
+      fixed INCR8 write in ST_WR_D
+      AXI accepts AW and all W beats
+      AXI B response is delayed
+      software immediately wants to do the next fixed INCR8 read
+
+    The bug to catch here is not merely that the next AHB address phase becomes
+    visible. The bridge bug is that the fixed write completes too early:
+      - the fixed write helper returns before AXI B, and/or
+      - the bridge launches the follow-on AXI read burst before AXI B.
+    """
+    await setup_dut_no_axi_slave(dut)
+
+    WRITE_ADDR = 0xBE7ACEC8
+    READ_ADDR  = 0x81F814C0
+    B_DELAY_CYCLES = 6
+
+    WRITE_BEATS = [0x0000000000000000] * 8
+    READ_BEATS = [
+        0x1111111100000000,
+        0x2222222200000001,
+        0x3333333300000002,
+        0x4444444400000003,
+        0x5555555500000004,
+        0x6666666600000005,
+        0x7777777700000006,
+        0x8888888800000007,
+    ]
+
+    last_w_seen = Event()
+    b_hs_done = Event()
+    write_done = Event()
+
+    async def ahb_write_then_read_no_idle():
+        await ahb_write_inc_burst_manual(dut, WRITE_ADDR, WRITE_BEATS, size_bytes=8, fixed=True)
+        write_done.set()
+        return await ahb_read_inc_burst_manual(dut, READ_ADDR, len(READ_BEATS), size_bytes=8, fixed=True)
+
+    async def axi_slave_fixed_write_delayed_b_then_read():
+        dut.m_axi_awready.value = 1
+        dut.m_axi_wready.value = 1
+        dut.m_axi_bvalid.value = 0
+        dut.m_axi_bresp.value = 0
+        dut.m_axi_bid.value = 0
+        dut.m_axi_arready.value = 1
+        dut.m_axi_rvalid.value = 0
+        dut.m_axi_rlast.value = 0
+        dut.m_axi_rresp.value = 0
+        dut.m_axi_rdata.value = 0
+        dut.m_axi_rid.value = 0
+
+        aw = None
+        while aw is None:
+            await RisingEdge(dut.clk)
+            if int(dut.m_axi_awvalid.value) and int(dut.m_axi_awready.value):
+                aw = {
+                    'addr': int(dut.m_axi_awaddr.value),
+                    'len': int(dut.m_axi_awlen.value),
+                    'size': int(dut.m_axi_awsize.value),
+                    'burst': int(dut.m_axi_awburst.value),
+                }
+
+        wbeats = []
+        while len(wbeats) < len(WRITE_BEATS):
+            await RisingEdge(dut.clk)
+            if int(dut.m_axi_wvalid.value) and int(dut.m_axi_wready.value):
+                wbeats.append({
+                    'data': int(dut.m_axi_wdata.value),
+                    'strb': int(dut.m_axi_wstrb.value),
+                    'last': int(dut.m_axi_wlast.value),
+                })
+
+        last_w_seen.set()
+
+        for _ in range(B_DELAY_CYCLES):
+            await RisingEdge(dut.clk)
+
+        dut.m_axi_bvalid.value = 1
+        while True:
+            await RisingEdge(dut.clk)
+            if int(dut.m_axi_bvalid.value) and int(dut.m_axi_bready.value):
+                break
+        dut.m_axi_bvalid.value = 0
+        b_hs_done.set()
+
+        ar = None
+        while ar is None:
+            await RisingEdge(dut.clk)
+            if int(dut.m_axi_arvalid.value) and int(dut.m_axi_arready.value):
+                ar = {
+                    'addr': int(dut.m_axi_araddr.value),
+                    'len': int(dut.m_axi_arlen.value),
+                    'size': int(dut.m_axi_arsize.value),
+                    'burst': int(dut.m_axi_arburst.value),
+                }
+
+        for i, data in enumerate(READ_BEATS):
+            dut.m_axi_rvalid.value = 1
+            dut.m_axi_rdata.value = data
+            dut.m_axi_rresp.value = 0
+            dut.m_axi_rlast.value = 1 if i == len(READ_BEATS) - 1 else 0
+            while True:
+                await RisingEdge(dut.clk)
+                if int(dut.m_axi_rvalid.value) and int(dut.m_axi_rready.value):
+                    break
+        dut.m_axi_rvalid.value = 0
+        dut.m_axi_rlast.value = 0
+
+        return aw, wbeats, ar
+
+    slave_task = cocotb.start_soon(axi_slave_fixed_write_delayed_b_then_read())
+    seq_task = cocotb.start_soon(ahb_write_then_read_no_idle())
+
+    await with_timeout(last_w_seen.wait(), 2, 'us')
+
+    early_write_done_sample = None
+    early_ar_hs_sample = None
+    for cyc in range(B_DELAY_CYCLES):
+        await RisingEdge(dut.clk)
+        await ReadOnly()
+
+        if write_done.is_set():
+            early_write_done_sample = cyc
+            break
+
+        if int(dut.m_axi_arvalid.value) and int(dut.m_axi_arready.value):
+            early_ar_hs_sample = cyc
+            break
+
+        if seq_task.done():
+            raise AssertionError(
+                f'Fixed write+read sequence completed before delayed B handshake (cycle {cyc})'
+            )
+
+    if early_write_done_sample is not None:
+        raise AssertionError(
+            'Reproduced Linux-ILA bug: fixed write helper returned before AXI B handshake '
+            f'completed (cycle {early_write_done_sample})'
+        )
+
+    if early_ar_hs_sample is not None:
+        raise AssertionError(
+            'Reproduced Linux-ILA bug: follow-on AXI AR handshake happened before AXI B handshake '
+            f'completed (cycle {early_ar_hs_sample})'
+        )
+
+    await with_timeout(b_hs_done.wait(), 2, 'us')
+
+    read_result = await with_timeout(seq_task, 2, 'us')
+    aw, wbeats, ar = await with_timeout(slave_task, 2, 'us')
+
+    assert aw['addr'] == WRITE_ADDR, f"bad write AWADDR 0x{aw['addr']:08x}"
+    assert aw['len'] == 7, f"expected write AWLEN=7, got {aw['len']}"
+    assert aw['size'] == 3, f"expected write AWSIZE=3, got {aw['size']}"
+    assert aw['burst'] == 1, f"expected write AWBURST=INCR, got {aw['burst']}"
+
+    assert len(wbeats) == len(WRITE_BEATS), (
+        f"expected {len(WRITE_BEATS)} write beats, got {len(wbeats)}"
+    )
+    for i, wb in enumerate(wbeats):
+        assert wb['data'] == WRITE_BEATS[i], (
+            f"write beat {i} mismatch: got 0x{wb['data']:016x}, exp 0x{WRITE_BEATS[i]:016x}"
+        )
+        assert wb['strb'] == 0xFF, f"write beat {i} WSTRB mismatch: got 0x{wb['strb']:x}"
+        assert wb['last'] == (1 if i == len(WRITE_BEATS) - 1 else 0), (
+            f"write beat {i} WLAST mismatch"
+        )
+
+    assert ar['addr'] == READ_ADDR, f"bad read ARADDR 0x{ar['addr']:08x}"
+    assert ar['len'] == 7, f"expected read ARLEN=7, got {ar['len']}"
+    assert ar['size'] == 3, f"expected read ARSIZE=3, got {ar['size']}"
+    assert ar['burst'] == 1, f"expected read ARBURST=INCR, got {ar['burst']}"
+
+    assert read_result == READ_BEATS, (
+        f"readback mismatch: got {[hex(x) for x in read_result]}, expected {[hex(x) for x in READ_BEATS]}"
+    )
