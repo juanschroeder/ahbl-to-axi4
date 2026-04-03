@@ -213,6 +213,7 @@ module ahb_to_axi4_burst #(
   logic [DW-1:0]     pnd_wfirst_data;
   logic [DW/8-1:0]   pnd_wfirst_strb;
   logic              pnd_wpipe_mode;
+  logic              pnd_align_pulse_q;
 
   // wstrb derivation
   logic [DW/8-1:0] ahb_wstrb_d;
@@ -359,6 +360,7 @@ module ahb_to_axi4_burst #(
       pnd_wfirst_data  <= '0;
       pnd_wfirst_strb  <= '0;
       pnd_wpipe_mode   <= 1'b0;
+      pnd_align_pulse_q <= 1'b0;
       // loop fix
       hsel_q      <= 1'b0;
       hreadyin_q  <= 1'b0;
@@ -433,6 +435,9 @@ module ahb_to_axi4_burst #(
                   aw_sent     <= 1'b0;
                   pnd_wfirst_valid <= 1'b0;
                   pnd_wpipe_mode   <= 1'b0;
+                  pnd_align_pulse_q <= (HADDR == pnd_addr) &&
+                                       (HTRANS == TRN_NONSEQ) &&
+                                       HWRITE;
                   wstrb_first <= ahb_addrsize_to_wstrb(pnd_addr, pnd_size);
                   state       <= ST_WR_PND_ALIGN;
                 end
@@ -491,12 +496,10 @@ module ahb_to_axi4_burst #(
           // Two startup cases exist for a pending fixed write:
           // 1) The master is still holding the pending NONSEQ address phase.
           //    Give it one HREADY pulse so beat 0 reaches HWDATA next cycle.
-          // 2) The master has already advanced beyond that NONSEQ (bug8-style).
-          //    Beat 0 is already on HWDATA, so capture it immediately.
-          if (!pnd_wpipe_mode &&
-              (HADDR == pnd_addr) &&
-              (HTRANS == TRN_NONSEQ) &&
-              HWRITE) begin
+        // 2) The master has already advanced beyond that NONSEQ (bug8-style).
+        //    Beat 0 is already on HWDATA, so capture it immediately.
+          if (pnd_align_pulse_q) begin
+            pnd_align_pulse_q <= 1'b0;
             pnd_wpipe_mode <= 1'b1;
             state          <= ST_WR_PND_ALIGN;
           end else begin
@@ -1056,13 +1059,7 @@ module ahb_to_axi4_burst #(
       end
 
       ST_WR_PND_ALIGN: begin
-        if (!pnd_wpipe_mode &&
-            (HADDR == pnd_addr) &&
-            (HTRANS == TRN_NONSEQ) &&
-            HWRITE)
-          HREADY = 1'b1;
-        else
-          HREADY = 1'b0;
+        HREADY = pnd_align_pulse_q;
       end
 
       ST_WR_D: begin
