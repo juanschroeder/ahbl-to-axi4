@@ -1,0 +1,48 @@
+# =============================================================================
+# ahb_to_axi4_burst_v11c_deadlock.sby
+#
+# Formal verification targeting deadlock prevention in write completion ordering.
+# This was found to have a real bug - ARVALID can assert while write B is pending!
+#
+# HOW TO RUN (from the project root):
+#
+#   sby -f formal/ahb_to_axi4_burst_v11c_deadlock.sby
+#
+# TASKS
+#   bmc   — Bounded Model Check to depth 100.
+#           Verifies no deadlocks occur within bounded time.
+#
+#   cover — Reachability check.
+#           Verify deadlock scenarios can be reached and tested.
+#
+# INTERPRETING RESULTS
+#   PASS (bmc)  → no deadlock violations found
+#   FAIL (bmc)  → found deadlock counterexample; check .vcd (REAL BUG!)
+#   PASS (cover)→ all deadlock scenarios are reachable
+#   FAIL (cover)→ some scenarios unreachable (environment too constrained)
+# =============================================================================
+
+[tasks]
+bmc
+cover
+
+[options]
+bmc:   mode bmc
+bmc:   depth 100
+cover: mode cover
+cover: depth 80
+
+[engines]
+smtbmc yices
+
+[script]
+# read_verilog -formal -sv ahb_to_axi4_burst_v11c_sby.sv
+read_verilog -formal -sv ahb_to_axi4_burst_formal_tap.sv
+read_verilog -formal -sv ahb_to_axi4_burst_deadlock_fv.sv
+#prep -top ahb_to_axi4_burst_v11c_deadlock_fv
+prep -top  ahb_to_axi4_burst_deadlock_fv
+
+[files]
+rtl/ahb_to_axi4_burst_formal_tap.sv
+# formal/ahb_to_axi4_burst_v11c_sby.sv
+formal/ahb_to_axi4_burst_deadlock_fv.sv

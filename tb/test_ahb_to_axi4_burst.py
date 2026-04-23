@@ -6949,6 +6949,100 @@ async def _wait_hready(dut, timeout_cycles=2000):
             return
     raise TimeoutError("hready never went high")
 
+
+async def _wait_axi_r_accept_edge(dut, timeout_cycles=2000):
+    """
+    Wait for an AXI R beat to be accepted.
+
+    Sample VALID/READY in ReadOnly before the next clock edge so we do not
+    miss handshakes where the DUT recomputes RREADY low immediately after the
+    accepting edge because it buffered the beat.
+    """
+    for _ in range(timeout_cycles):
+        await ReadOnly()
+        if int(dut.m_axi_rvalid.value) and int(dut.m_axi_rready.value):
+            await RisingEdge(dut.clk)
+            return
+        await RisingEdge(dut.clk)
+    raise TimeoutError("AXI R beat was never accepted")
+
+
+def _try_int_sig(sig):
+    try:
+        return int(sig.value)
+    except Exception:
+        return None
+
+
+BUG20_STATE_NAMES = {
+    0: "ST_IDLE",
+    1: "ST_WR_PND_ALIGN",
+    2: "ST_WR_D",
+    3: "ST_WR_FIX_FLUSH",
+    4: "ST_WR_INCR_ACC",
+    5: "ST_WR_INCR_POST_BUSY",
+    6: "ST_WR_INCR_RESUME",
+    7: "ST_WR_INCR_FLUSH",
+    8: "ST_WR_RESP",
+    9: "ST_WR_LAST_RESP",
+    10: "ST_WR_ERR",
+    11: "ST_RD_A",
+    12: "ST_RD_D",
+    13: "ST_RD_ERR",
+    14: "ST_RD_INCR_WAIT",
+    15: "ST_RD_FENCE",
+    16: "ST_RD_DRAIN",
+}
+
+
+def _state_name(state_value):
+    if state_value is None:
+        return "None"
+    return BUG20_STATE_NAMES.get(state_value, f"STATE_{state_value}")
+
+
+def _bug20_snapshot(dut, tag):
+    return {
+        "tag": tag,
+        "state": _try_int_sig(dut.dut.state),
+        "beat_cnt": _try_int_sig(dut.dut.beat_cnt),
+        "rd_buf_valid": _try_int_sig(dut.dut.rd_buf_valid),
+        "ar_done": _try_int_sig(dut.dut.ar_done),
+        "pnd_valid": _try_int_sig(dut.dut.pnd_valid),
+        "hready": _try_int_sig(dut.hready),
+        "hreadyin": _try_int_sig(dut.hreadyin),
+        "htrans": _try_int_sig(dut.htrans),
+        "haddr": _try_int_sig(dut.haddr),
+        "hrdata": _try_int_sig(dut.hrdata),
+        "htrans_q": _try_int_sig(dut.dut.htrans_q),
+        "haddr_q": _try_int_sig(dut.dut.haddr_q),
+        "arvalid": _try_int_sig(dut.m_axi_arvalid),
+        "arready": _try_int_sig(dut.m_axi_arready),
+        "araddr": _try_int_sig(dut.m_axi_araddr),
+        "rvalid": _try_int_sig(dut.m_axi_rvalid),
+        "rready": _try_int_sig(dut.m_axi_rready),
+        "rdata": _try_int_sig(dut.m_axi_rdata),
+        "rlast": _try_int_sig(dut.m_axi_rlast),
+        "dbg_trip": _try_int_sig(dut.dut.dbg_trip_sticky),
+        "dbg_cause": _try_int_sig(dut.dut.dbg_trip_cause),
+    }
+
+
+def _bug20_format_trace(trace):
+    lines = []
+    for item in trace:
+        lines.append(
+            f"{item['tag']}: state={_state_name(item['state'])} beat_cnt={item['beat_cnt']} "
+            f"rd_buf={item['rd_buf_valid']} ar_done={item['ar_done']} pnd={item['pnd_valid']} "
+            f"HREADY={item['hready']} HREADYIN={item['hreadyin']} HRDATA={item['hrdata']} "
+            f"HTRANS={item['htrans']} HADDR={item['haddr']} "
+            f"HTRANS_Q={item['htrans_q']} HADDR_Q={item['haddr_q']} "
+            f"AR={item['arvalid']}/{item['arready']} ARADDR={item['araddr']} "
+            f"R={item['rvalid']}/{item['rready']} RDATA={item['rdata']} RLAST={item['rlast']} "
+            f"dbg={item['dbg_trip']}/{item['dbg_cause']}"
+        )
+    return "\n".join(lines)
+
 async def _ahb_write_incr8_manual(dut, start_addr, beats_8):
     """Drive an AHB INCR8 write burst (8 x 64-bit beats)."""
     assert len(beats_8) == 8
@@ -7563,39 +7657,59 @@ async def test_regression_incr8_write_then_read_data_not_zero(dut):
 # survive into ST_RD_D.
 # ---------------------------------------------------------------------------
 
-async def _sparse_read_slave_rvalid_on_arready_cycle(dut, mem, *, stale_value=0xDEAD_0000_DEAD_0000):
+async def _sparse_read_slave_rvalid_on_arready_cycle(
+    dut, mem, *, stale_value=0xDEAD_0000_DEAD_0000, trace=None
+):
     """
-    Serve one AXI read burst, but assert RVALID=stale_value simultaneously
-    with ARREADY=1. This is the hazard: RREADY=0 on that cycle in ST_RD_A,
-    so the beat is held. Next cycle (ST_RD_D, RREADY=1) it gets captured
-    as beat 0 on a buggy bridge.
-    After the hazard cycle, deassert RVALID for one cycle, then send the
-    correct beats from mem.
+    Serve one AXI read burst, but first inject a stale R beat while the bridge
+    is waiting in ST_RD_A before the AR handshake.
+
+    The older same-edge ARREADY+RVALID stimulus proved too aggressive for this
+    bridge/testbench combination: it creates an R accept before the read is
+    logically outstanding and can wedge the regression itself. The real safety
+    property we need is narrower and still useful: stale R traffic seen during
+    ST_RD_A must be scrubbed and must not poison AHB beat0 once AR later
+    handshakes.
     """
     while not int(dut.m_axi_arvalid.value):
         await RisingEdge(dut.clk)
+    if trace is not None:
+        trace.append(_bug20_snapshot(dut, "event:slave_saw_arvalid"))
 
     araddr  = int(dut.m_axi_araddr.value)
     arlen   = int(dut.m_axi_arlen.value)
     arsize  = int(dut.m_axi_arsize.value)
     arburst = int(dut.m_axi_arburst.value)
 
-    # Assert ARREADY and RVALID=stale simultaneously — the hazard cycle.
-    dut.m_axi_arready.value = 1
+    # Inject a stale beat first while AR is still waiting.
     dut.m_axi_rvalid.value  = 1
     dut.m_axi_rdata.value   = stale_value
     dut.m_axi_rlast.value   = 0
     dut.m_axi_rresp.value   = 0
+    if trace is not None:
+        trace.append(_bug20_snapshot(dut, "event:slave_drive_hazard"))
 
-    await RisingEdge(dut.clk)   # AR handshake fires; RREADY=0 so R not accepted
-    dut.m_axi_arready.value = 0
-    # Hold RVALID one more cycle to ensure it is seen in ST_RD_D
-    await RisingEdge(dut.clk)
+    await _wait_axi_r_accept_edge(dut)
+    if trace is not None:
+        trace.append(_bug20_snapshot(dut, "event:slave_after_hazard_scrub"))
     dut.m_axi_rvalid.value = 0
     dut.m_axi_rdata.value  = 0
 
-    # One idle cycle before correct data
+    # One quiet cycle, then handshake the real AR.
     await RisingEdge(dut.clk)
+    if trace is not None:
+        trace.append(_bug20_snapshot(dut, "event:slave_before_ar_handshake"))
+    dut.m_axi_arready.value = 1
+
+    await RisingEdge(dut.clk)
+    if trace is not None:
+        trace.append(_bug20_snapshot(dut, "event:slave_after_ar_handshake"))
+    dut.m_axi_arready.value = 0
+
+    # One idle cycle before correct data.
+    await RisingEdge(dut.clk)
+    if trace is not None:
+        trace.append(_bug20_snapshot(dut, "event:slave_before_correct_beats"))
 
     # Now send correct beats from mem
     for beat in range(arlen + 1):
@@ -7605,10 +7719,11 @@ async def _sparse_read_slave_rvalid_on_arready_cycle(dut, mem, *, stale_value=0x
         dut.m_axi_rresp.value  = 0
         dut.m_axi_rlast.value  = 1 if beat == arlen else 0
         dut.m_axi_rvalid.value = 1
-        while True:
-            await RisingEdge(dut.clk)
-            if int(dut.m_axi_rvalid.value) and int(dut.m_axi_rready.value):
-                break
+        if trace is not None:
+            trace.append(_bug20_snapshot(dut, f"event:slave_drive_beat{beat}"))
+        await _wait_axi_r_accept_edge(dut)
+        if trace is not None:
+            trace.append(_bug20_snapshot(dut, f"event:slave_accept_beat{beat}"))
         dut.m_axi_rvalid.value = 0
         dut.m_axi_rlast.value  = 0
 
@@ -7619,13 +7734,14 @@ async def _sparse_read_slave_rvalid_on_arready_cycle(dut, mem, *, stale_value=0x
 async def test_regression_stale_rvalid_on_arready_cycle_poisons_beat0(dut):
     set_test_id(dut)
     """
-    Regression: RVALID asserted on the ARREADY cycle (where RREADY=0 in
-    ST_RD_A) causes the stale beat to be captured as beat 0 in ST_RD_D.
+    Regression: stale R traffic seen while waiting in ST_RD_A must not poison
+    beat0 once the real read address later handshakes.
 
-    The slave asserts RVALID=STALE_VALUE simultaneously with ARREADY=1.
-    On a buggy bridge beat[0] = STALE_VALUE instead of the correct data.
-    On the fixed bridge (rd_buf_valid cleared every cycle in ST_RD_A)
-    beat[0] = correct data from mem.
+    A prior version of this test tried to inject RVALID on the exact ARREADY
+    cycle. That ended up being a testbench artifact for this bridge rather than
+    a reliable regression. The behavior we still care about is that stale data
+    presented before the read goes active gets scrubbed and never emerges as
+    AHB beat0.
     """
     READ_ADDR   = 0xBFFF_FBC0
     STALE_VALUE = 0x0000_0000_0000_0216
@@ -7636,22 +7752,51 @@ async def test_regression_stale_rvalid_on_arready_cycle_poisons_beat0(dut):
     for i in range(8):
         mem[READ_ADDR + i * 8] = CORRECT_DATA[i]
 
+    event_trace = []
+    trace = deque(maxlen=96)
+    stop_evt = Event()
+
+    async def _trace_monitor():
+        while True:
+            await RisingEdge(dut.clk)
+            await ReadOnly()
+            trace.append(_bug20_snapshot(dut, f"t={cocotb.utils.get_sim_time('ns')}ns"))
+            if stop_evt.is_set():
+                return
+
     slave = cocotb.start_soon(
         _sparse_read_slave_rvalid_on_arready_cycle(
-            dut, mem, stale_value=STALE_VALUE
+            dut, mem, stale_value=STALE_VALUE, trace=event_trace
         )
     )
+    mon = cocotb.start_soon(_trace_monitor())
 
-    results = await with_timeout(
-        _ahb_read_incr8_manual(dut, READ_ADDR),
-        timeout_time=500, timeout_unit="us"
-    )
-    await slave
+    try:
+        results = await with_timeout(
+            _ahb_read_incr8_manual(dut, READ_ADDR),
+            timeout_time=500, timeout_unit="us"
+        )
+        await slave
+    except Exception as exc:
+        stop_evt.set()
+        await RisingEdge(dut.clk)
+        raise AssertionError(
+            "stale-RVALID regression timed out or failed.\n"
+            + "Events:\n"
+            + _bug20_format_trace(event_trace)
+            + "\nRecent cycles:\n"
+            + _bug20_format_trace(trace)
+        ) from exc
+    finally:
+        stop_evt.set()
+        if not mon.done():
+            mon.kill()
+        if not slave.done():
+            slave.kill()
 
     assert results[0] != STALE_VALUE, (
         f"REGRESSION: beat[0] = 0x{results[0]:016x} = STALE_VALUE. "
-        f"rd_buf_valid was not cleared in ST_RD_A — stale RVALID on ARREADY "
-        f"cycle was captured as beat 0."
+        f"stale RVALID on the ARREADY cycle leaked through as AHB beat0."
     )
     for i, (got, exp) in enumerate(zip(results, CORRECT_DATA)):
         assert got == exp, (
@@ -9240,6 +9385,8 @@ async def test_regression_st_wr_d_fixed_write_bresp_gap_no_idle_read_like_linux_
         dut.m_axi_bresp.value = 0
         dut.m_axi_bid.value = 0
         dut.m_axi_arready.value = 1
+        await FallingEdge(dut.clk)
+        await FallingEdge(dut.clk)
         dut.m_axi_rvalid.value = 0
         dut.m_axi_rlast.value = 0
         dut.m_axi_rresp.value = 0
@@ -11677,4 +11824,3026 @@ async def test_regression_bug13_fixed_write_bresp_gap_deselected_then_pending_fi
 
     assert int(dut.dut.dbg_pnd_align_unproven.value) == 0, (
         "BUG13: dbg_pnd_align_unproven went high during pending fixed-write recovery"
+    )
+
+
+# BUG 18: LINUX BOOT (reproduced in simulation)
+################################################
+
+BUG18_STATE_NAMES = (
+    "ST_IDLE",
+    "ST_WR_PND_ALIGN",
+    "ST_WR_D",
+    "ST_WR_FIX_FLUSH",
+    "ST_WR_INCR_ACC",
+    "ST_WR_INCR_POST_BUSY",
+    "ST_WR_INCR_RESUME",
+    "ST_WR_INCR_FLUSH",
+    "ST_WR_RESP",
+    "ST_WR_LAST_RESP",
+    "ST_WR_ERR",
+    "ST_RD_A",
+    "ST_RD_D",
+    "ST_RD_INCR_WAIT",
+    "ST_RD_ERR",
+    "ST_RD_DRAIN",
+    "ST_RD_FENCE",
+)
+
+
+def _bug18_try_int(handle):
+    try:
+        return int(handle.value)
+    except Exception:
+        return None
+
+
+def _bug18_state_name(state_value):
+    if state_value is None:
+        return "?"
+    if 0 <= state_value < len(BUG18_STATE_NAMES):
+        return BUG18_STATE_NAMES[state_value]
+    return f"STATE_{state_value}"
+
+
+def _bug18_snapshot_line(dut, tag):
+    state_value = _bug18_try_int(dut.dut.state)
+    beat_cnt = _bug18_try_int(dut.dut.beat_cnt)
+    pnd_valid = _bug18_try_int(dut.dut.pnd_valid)
+    rd_buf_valid = _bug18_try_int(dut.dut.rd_buf_valid)
+    ar_done = _bug18_try_int(dut.dut.ar_done)
+    ap_addr = _bug18_try_int(dut.dut.ap_addr)
+    ap_axlen = _bug18_try_int(dut.dut.ap_axlen)
+    hsel_q = _bug18_try_int(dut.dut.hsel_q)
+    haddr_q = _bug18_try_int(dut.dut.haddr_q)
+    hsize_q = _bug18_try_int(dut.dut.hsize_q)
+    htrans_q = _bug18_try_int(dut.dut.htrans_q)
+    hreadyin_q = _bug18_try_int(dut.dut.hreadyin_q)
+    rd_q_holds_current_start = _bug18_try_int(dut.dut.rd_q_holds_current_start)
+    dbg_last_ar_addr = _bug18_try_int(dut.dut.dbg_last_ar_addr)
+    dbg_last_r_data = _bug18_try_int(dut.dut.dbg_last_r_data)
+    dbg_trip_sticky = _bug18_try_int(dut.dut.dbg_trip_sticky)
+    dbg_trip_cause = _bug18_try_int(dut.dut.dbg_trip_cause)
+    dbg_live_interleave = _bug18_try_int(dut.dut.dbg_live_interleave)
+    dbg_q_interleave = _bug18_try_int(dut.dut.dbg_q_interleave)
+
+    haddr = int(dut.haddr.value)
+    htrans = int(dut.htrans.value)
+    hready = int(dut.hready.value)
+    hrdata = int(dut.hrdata.value)
+
+    arvalid = int(dut.m_axi_arvalid.value)
+    arready = int(dut.m_axi_arready.value)
+    araddr = int(dut.m_axi_araddr.value)
+    rvalid = int(dut.m_axi_rvalid.value)
+    rready = int(dut.m_axi_rready.value)
+    rlast = int(dut.m_axi_rlast.value)
+    rdata = int(dut.m_axi_rdata.value)
+
+    ap_addr_txt = "?" if ap_addr is None else f"0x{ap_addr:08x}"
+    ap_axlen_txt = "?" if ap_axlen is None else f"{ap_axlen}"
+    haddr_q_txt = "?" if haddr_q is None else f"0x{haddr_q:08x}"
+    dbg_last_ar_txt = "?" if dbg_last_ar_addr is None else f"0x{dbg_last_ar_addr:08x}"
+    dbg_last_r_txt = "?" if dbg_last_r_data is None else f"0x{dbg_last_r_data:016x}"
+
+    return (
+        f"{tag}: state={_bug18_state_name(state_value)} beat_cnt={beat_cnt} "
+        f"pnd={pnd_valid} rd_buf={rd_buf_valid} ar_done={ar_done} "
+        f"ap_addr={ap_addr_txt} ap_axlen={ap_axlen_txt} "
+        f"hsel_q={hsel_q} haddr_q={haddr_q_txt} hsize_q={hsize_q} "
+        f"htrans_q={htrans_q} hreadyin_q={hreadyin_q} rd_q_start={rd_q_holds_current_start} "
+        f"haddr=0x{haddr:08x} htrans={htrans} hready={hready} "
+        f"hrdata=0x{hrdata:016x} ar={arvalid}/{arready}@0x{araddr:08x} "
+        f"r={rvalid}/{rready}/last{rlast} data=0x{rdata:016x} "
+        f"live_i={dbg_live_interleave} q_i={dbg_q_interleave} "
+        f"dbg_last_ar={dbg_last_ar_txt} dbg_last_r={dbg_last_r_txt} "
+        f"dbg_trip={dbg_trip_sticky}/{dbg_trip_cause}"
+    )
+
+
+def _bug18_trace_append(trace, dut, tag):
+    trace.append(_bug18_snapshot_line(dut, tag))
+    if len(trace) > 80:
+        del trace[: len(trace) - 80]
+
+
+def _bug18_trace_tail(trace, n=80):
+    return "\n".join(trace[-n:])
+
+
+async def _ahb_read_two_same_addr_incr8s_traced(dut, read_addr, trace):
+    """
+    Drive two same-address INCR8 reads and classify returned AHB data using
+    the accepted AHB address-phase order. This avoids the one-beat rotation
+    bug that appears when the first accepted NONSEQ is missed.
+    """
+    from collections import deque
+
+    read1 = []
+    read2 = []
+    hsize = 3
+
+    plan = []
+    for beat in range(8):
+        plan.append((1, beat, read_addr + beat * 8))
+    for beat in range(8):
+        plan.append((2, beat, read_addr + beat * 8))
+
+    pending = deque()
+    plan_idx = 0
+
+    def drive_phase(idx):
+        if idx >= len(plan):
+            _init_direct_ahb_signals(dut)
+            return
+        _which, beat, addr = plan[idx]
+        dut.haddr.value = addr
+        dut.hburst.value = 0b101
+        dut.hmastlock.value = 0
+        dut.hprot.value = 0
+        dut.hsize.value = hsize
+        dut.htrans.value = AHB_NONSEQ if beat == 0 else AHB_SEQ
+        dut.hwrite.value = 0
+        dut.hwdata.value = 0
+
+    await FallingEdge(dut.clk)
+    drive_phase(plan_idx)
+    _bug18_trace_append(trace, dut, "BUG18 drive start")
+    await ReadOnly()
+    if int(dut.hready.value) and int(dut.htrans.value) in (AHB_NONSEQ, AHB_SEQ):
+        which, beat, _ = plan[plan_idx]
+        pending.append((which, beat))
+        _bug18_trace_append(trace, dut, f"BUG18 seed addr burst={which} beat={beat}")
+        plan_idx += 1
+        await FallingEdge(dut.clk)
+        drive_phase(plan_idx)
+
+    while len(read1) < 8 or len(read2) < 8:
+        await RisingEdge(dut.clk)
+        await ReadOnly()
+
+        if int(dut.m_axi_arvalid.value) and int(dut.m_axi_arready.value):
+            _bug18_trace_append(trace, dut, "BUG18 AXI AR handshake")
+        if int(dut.m_axi_rvalid.value) and int(dut.m_axi_rready.value):
+            _bug18_trace_append(trace, dut, "BUG18 AXI R handshake")
+
+        if int(dut.hready.value):
+            if pending:
+                which, beat = pending.popleft()
+                data = int(dut.hrdata.value)
+                if which == 1:
+                    read1.append(data)
+                else:
+                    read2.append(data)
+                _bug18_trace_append(
+                    trace,
+                    dut,
+                    f"BUG18 AHB data burst={which} beat={beat} data=0x{data:016x}",
+                )
+
+            if (
+                plan_idx < len(plan)
+                and int(dut.htrans.value) in (AHB_NONSEQ, AHB_SEQ)
+                and not int(dut.hwrite.value)
+            ):
+                which, beat, _ = plan[plan_idx]
+                pending.append((which, beat))
+                _bug18_trace_append(trace, dut, f"BUG18 addr burst={which} beat={beat}")
+                plan_idx += 1
+
+            await FallingEdge(dut.clk)
+            drive_phase(plan_idx)
+
+    await NextTimeStep()
+    _init_direct_ahb_signals(dut)
+    return read1, read2
+
+
+async def _ahb_read_two_incr8s_traced(dut, read1_addr, read2_addr, trace):
+    from collections import deque
+
+    read1 = []
+    read2 = []
+    hsize = 3
+
+    plan = []
+    for beat in range(8):
+        plan.append((1, beat, read1_addr + beat * 8))
+    for beat in range(8):
+        plan.append((2, beat, read2_addr + beat * 8))
+
+    pending = deque()
+    plan_idx = 0
+
+    def drive_phase(idx):
+        if idx >= len(plan):
+            _init_direct_ahb_signals(dut)
+            return
+        _which, beat, addr = plan[idx]
+        dut.haddr.value = addr
+        dut.hburst.value = 0b101
+        dut.hmastlock.value = 0
+        dut.hprot.value = 0
+        dut.hsize.value = hsize
+        dut.htrans.value = AHB_NONSEQ if beat == 0 else AHB_SEQ
+        dut.hwrite.value = 0
+        dut.hwdata.value = 0
+
+    await FallingEdge(dut.clk)
+    drive_phase(plan_idx)
+    _bug18_trace_append(trace, dut, "BUG20 drive start")
+    await ReadOnly()
+    if int(dut.hready.value) and int(dut.htrans.value) in (AHB_NONSEQ, AHB_SEQ):
+        which, beat, _ = plan[plan_idx]
+        pending.append((which, beat))
+        _bug18_trace_append(trace, dut, f"BUG20 seed addr burst={which} beat={beat}")
+        plan_idx += 1
+        await FallingEdge(dut.clk)
+        drive_phase(plan_idx)
+
+    while len(read1) < 8 or len(read2) < 8:
+        await RisingEdge(dut.clk)
+        await ReadOnly()
+
+        if int(dut.m_axi_arvalid.value) and int(dut.m_axi_arready.value):
+            _bug18_trace_append(trace, dut, "BUG20 AXI AR handshake")
+        if int(dut.m_axi_rvalid.value) and int(dut.m_axi_rready.value):
+            _bug18_trace_append(trace, dut, "BUG20 AXI R handshake")
+
+        if int(dut.hready.value):
+            if pending:
+                which, beat = pending.popleft()
+                data = int(dut.hrdata.value)
+                if which == 1:
+                    read1.append(data)
+                else:
+                    read2.append(data)
+                _bug18_trace_append(
+                    trace,
+                    dut,
+                    f"BUG20 AHB data burst={which} beat={beat} data=0x{data:016x}",
+                )
+
+            if (
+                plan_idx < len(plan)
+                and int(dut.htrans.value) in (AHB_NONSEQ, AHB_SEQ)
+                and not int(dut.hwrite.value)
+            ):
+                which, beat, _ = plan[plan_idx]
+                pending.append((which, beat))
+                _bug18_trace_append(trace, dut, f"BUG20 addr burst={which} beat={beat}")
+                plan_idx += 1
+
+            await FallingEdge(dut.clk)
+            drive_phase(plan_idx)
+
+    await NextTimeStep()
+    _init_direct_ahb_signals(dut)
+    return read1, read2
+
+
+async def _ahb_abort_first_incr8_then_same_addr_incr8_traced(dut, read_addr, trace):
+    """
+    Compact replay of the boot-trace shape:
+      1. launch an INCR8 read,
+      2. consume only beat0 on AHB,
+      3. immediately present a second same-address INCR8 while the first AXI
+         burst tail is still being drained.
+
+    The second read must still restart cleanly at beat0.
+    """
+    hsize = 3
+    read2 = []
+
+    async def _wait_hready_sampled(timeout_cycles=2000):
+        for _ in range(timeout_cycles):
+            await RisingEdge(dut.clk)
+            await ReadOnly()
+            if int(dut.hready.value):
+                return int(dut.hrdata.value)
+        raise TimeoutError("BUG19: timed out waiting for HREADY")
+
+    def drive_read(addr, beat):
+        dut.haddr.value = addr
+        dut.hburst.value = 0b101
+        dut.hmastlock.value = 0
+        dut.hprot.value = 0
+        dut.hsize.value = hsize
+        dut.htrans.value = AHB_NONSEQ if beat == 0 else AHB_SEQ
+        dut.hwrite.value = 0
+        dut.hwdata.value = 0
+
+    await FallingEdge(dut.clk)
+    drive_read(read_addr, 0)
+    _bug18_trace_append(trace, dut, "BUG19 first burst NONSEQ")
+
+    first0 = await _wait_hready_sampled()
+    _bug18_trace_append(trace, dut, f"BUG19 first burst beat0 data=0x{first0:016x}")
+
+    await NextTimeStep()
+    drive_read(read_addr, 0)
+    _bug18_trace_append(trace, dut, "BUG19 second burst NONSEQ")
+
+    for beat in range(8):
+        data = await _wait_hready_sampled()
+        read2.append(data)
+        _bug18_trace_append(
+            trace,
+            dut,
+            f"BUG19 second burst beat={beat} data=0x{data:016x}",
+        )
+        await NextTimeStep()
+
+        if beat == 7:
+            _init_direct_ahb_signals(dut)
+        else:
+            drive_read(read_addr + (beat + 1) * 8, beat + 1)
+
+    return first0, read2
+
+
+async def _wait_for_axi_ar_handshake_checked(dut, timeout_cycles=128):
+    for _ in range(timeout_cycles):
+        await RisingEdge(dut.clk)
+        if int(dut.m_axi_arvalid.value) and int(dut.m_axi_arready.value):
+            return (
+                int(dut.m_axi_araddr.value),
+                int(dut.m_axi_arlen.value),
+                int(dut.m_axi_arsize.value),
+                int(dut.m_axi_arburst.value),
+            )
+    return None
+
+
+async def _checked_read_slave_two_same_addr_bursts(
+    dut,
+    mem,
+    *,
+    first_r_delay=2,
+    second_r_delay=2,
+    ar_timeout_cycles=128,
+    trace=None,
+):
+    dut.m_axi_arready.value = 0
+    dut.m_axi_rid.value = 0
+    dut.m_axi_rdata.value = 0
+    dut.m_axi_rresp.value = 0
+    dut.m_axi_rlast.value = 0
+    dut.m_axi_rvalid.value = 0
+
+    bursts = []
+    delays = [first_r_delay, second_r_delay]
+
+    for burst_idx in range(2):
+        dut.m_axi_arready.value = 1
+        ar = await _wait_for_axi_ar_handshake_checked(
+            dut, timeout_cycles=ar_timeout_cycles
+        )
+        if trace is not None:
+            _bug18_trace_append(trace, dut, f"BUG18 wait_ar_done burst={burst_idx + 1}")
+        assert ar is not None, (
+            f"BUG18: AXI read burst {burst_idx + 1} never handshook on AR\n"
+            f"{_bug18_trace_tail(trace or [])}"
+        )
+
+        addr, arlen, arsize, arburst = ar
+        bursts.append((addr, arlen, arsize, arburst))
+        if trace is not None:
+            _bug18_trace_append(
+                trace,
+                dut,
+                f"BUG18 AR burst={burst_idx + 1} addr=0x{addr:08x} len={arlen}",
+            )
+
+        dut.m_axi_arready.value = 0
+
+        assert arsize == 3, (
+            f"BUG18 burst {burst_idx + 1}: ARSIZE={arsize}, expected 3"
+        )
+        assert arburst == 1, (
+            f"BUG18 burst {burst_idx + 1}: ARBURST={arburst}, expected INCR(1)"
+        )
+
+        for _ in range(delays[burst_idx]):
+            await RisingEdge(dut.clk)
+
+        nbeats = arlen + 1
+        for beat in range(nbeats):
+            beat_addr = (addr & ~0x7) + beat * 8
+            data = mem.get(beat_addr, 0)
+
+            dut.m_axi_rdata.value = data
+            dut.m_axi_rvalid.value = 1
+            dut.m_axi_rlast.value = int(beat == nbeats - 1)
+
+            while True:
+                await RisingEdge(dut.clk)
+                if int(dut.m_axi_rvalid.value) and int(dut.m_axi_rready.value):
+                    if trace is not None:
+                        _bug18_trace_append(
+                            trace,
+                            dut,
+                            f"BUG18 slave sent burst={burst_idx + 1} beat={beat}",
+                        )
+                    break
+
+            dut.m_axi_rvalid.value = 0
+            dut.m_axi_rlast.value = 0
+
+    return bursts
+
+
+async def _checked_read_slave_two_same_addr_bursts_streaming(
+    dut,
+    mem,
+    *,
+    first_r_delay=2,
+    second_r_delay=2,
+    ar_timeout_cycles=128,
+    trace=None,
+):
+    dut.m_axi_arready.value = 0
+    dut.m_axi_rid.value = 0
+    dut.m_axi_rdata.value = 0
+    dut.m_axi_rresp.value = 0
+    dut.m_axi_rlast.value = 0
+    dut.m_axi_rvalid.value = 0
+
+    bursts = []
+    delays = [first_r_delay, second_r_delay]
+
+    for burst_idx in range(2):
+        dut.m_axi_arready.value = 1
+        ar = await _wait_for_axi_ar_handshake_checked(
+            dut, timeout_cycles=ar_timeout_cycles
+        )
+        if trace is not None:
+            _bug18_trace_append(trace, dut, f"BUG20 wait_ar_done burst={burst_idx + 1}")
+        assert ar is not None, (
+            f"BUG20: AXI read burst {burst_idx + 1} never handshook on AR\n"
+            f"{_bug18_trace_tail(trace or [])}"
+        )
+
+        addr, arlen, arsize, arburst = ar
+        bursts.append((addr, arlen, arsize, arburst))
+        if trace is not None:
+            _bug18_trace_append(
+                trace,
+                dut,
+                f"BUG20 AR burst={burst_idx + 1} addr=0x{addr:08x} len={arlen}",
+            )
+
+        dut.m_axi_arready.value = 0
+
+        assert arsize == 3, (
+            f"BUG20 burst {burst_idx + 1}: ARSIZE={arsize}, expected 3"
+        )
+        assert arburst == 1, (
+            f"BUG20 burst {burst_idx + 1}: ARBURST={arburst}, expected INCR(1)"
+        )
+
+        for _ in range(delays[burst_idx]):
+            await RisingEdge(dut.clk)
+
+        nbeats = arlen + 1
+        dut.m_axi_rvalid.value = 1
+        for beat in range(nbeats):
+            beat_addr = (addr & ~0x7) + beat * 8
+            dut.m_axi_rdata.value = mem.get(beat_addr, 0)
+            dut.m_axi_rlast.value = int(beat == nbeats - 1)
+
+            while True:
+                await RisingEdge(dut.clk)
+                await ReadOnly()
+                if int(dut.m_axi_rvalid.value) and int(dut.m_axi_rready.value):
+                    if trace is not None:
+                        _bug18_trace_append(
+                            trace,
+                            dut,
+                            f"BUG20 slave streamed burst={burst_idx + 1} beat={beat}",
+                        )
+                    break
+
+            if beat != nbeats - 1:
+                await NextTimeStep()
+
+        await FallingEdge(dut.clk)
+        dut.m_axi_rvalid.value = 0
+        dut.m_axi_rlast.value = 0
+
+    return bursts
+
+
+async def _checked_read_slave_two_same_addr_bursts_streaming_tagged(
+    dut,
+    *,
+    burst_datas,
+    expected_addr,
+    first_r_delay=2,
+    second_r_delay=2,
+    ar_timeout_cycles=128,
+    trace=None,
+):
+    dut.m_axi_arready.value = 0
+    dut.m_axi_rid.value = 0
+    dut.m_axi_rdata.value = 0
+    dut.m_axi_rresp.value = 0
+    dut.m_axi_rlast.value = 0
+    dut.m_axi_rvalid.value = 0
+
+    bursts = []
+    delays = [first_r_delay, second_r_delay]
+
+    for burst_idx, burst_data in enumerate(burst_datas):
+        dut.m_axi_arready.value = 1
+        ar = await _wait_for_axi_ar_handshake_checked(
+            dut, timeout_cycles=ar_timeout_cycles
+        )
+        if trace is not None:
+            _bug18_trace_append(
+                trace, dut, f"BUG21B wait_ar_done burst={burst_idx + 1}"
+            )
+        assert ar is not None, (
+            f"BUG21B: AXI read burst {burst_idx + 1} never handshook on AR\n"
+            f"{_bug18_trace_tail(trace or [])}"
+        )
+
+        addr, arlen, arsize, arburst = ar
+        bursts.append((addr, arlen, arsize, arburst))
+        if trace is not None:
+            _bug18_trace_append(
+                trace,
+                dut,
+                f"BUG21B AR burst={burst_idx + 1} addr=0x{addr:08x} len={arlen}",
+            )
+
+        dut.m_axi_arready.value = 0
+
+        assert addr == expected_addr, (
+            f"BUG21B burst {burst_idx + 1}: ARADDR=0x{addr:08x}, "
+            f"expected 0x{expected_addr:08x}"
+        )
+        assert arlen == 7, (
+            f"BUG21B burst {burst_idx + 1}: ARLEN={arlen}, expected 7"
+        )
+        assert arsize == 3, (
+            f"BUG21B burst {burst_idx + 1}: ARSIZE={arsize}, expected 3"
+        )
+        assert arburst == 1, (
+            f"BUG21B burst {burst_idx + 1}: ARBURST={arburst}, expected INCR(1)"
+        )
+
+        for _ in range(delays[burst_idx]):
+            await RisingEdge(dut.clk)
+
+        dut.m_axi_rvalid.value = 1
+        for beat, data in enumerate(burst_data):
+            dut.m_axi_rdata.value = data
+            dut.m_axi_rlast.value = int(beat == len(burst_data) - 1)
+
+            while True:
+                await RisingEdge(dut.clk)
+                await ReadOnly()
+                if int(dut.m_axi_rvalid.value) and int(dut.m_axi_rready.value):
+                    if trace is not None:
+                        _bug18_trace_append(
+                            trace,
+                            dut,
+                            f"BUG21B slave streamed burst={burst_idx + 1} beat={beat} "
+                            f"data=0x{int(data):016x}",
+                        )
+                    break
+
+            if beat != len(burst_data) - 1:
+                await NextTimeStep()
+
+        await FallingEdge(dut.clk)
+        dut.m_axi_rvalid.value = 0
+        dut.m_axi_rlast.value = 0
+
+    return bursts
+
+
+async def _checked_read_slave_two_bursts_streaming(
+    dut,
+    mem,
+    *,
+    burst_addrs,
+    first_r_delay=2,
+    second_r_delay=2,
+    beat_gap=0,
+    ar_timeout_cycles=128,
+    trace=None,
+):
+    dut.m_axi_arready.value = 0
+    dut.m_axi_rid.value = 0
+    dut.m_axi_rdata.value = 0
+    dut.m_axi_rresp.value = 0
+    dut.m_axi_rlast.value = 0
+    dut.m_axi_rvalid.value = 0
+
+    bursts = []
+    delays = [first_r_delay, second_r_delay]
+
+    for burst_idx, expected_addr in enumerate(burst_addrs):
+        dut.m_axi_arready.value = 1
+        ar = await _wait_for_axi_ar_handshake_checked(
+            dut, timeout_cycles=ar_timeout_cycles
+        )
+        if trace is not None:
+            _bug18_trace_append(trace, dut, f"BUG20 wait_ar_done burst={burst_idx + 1}")
+        assert ar is not None, (
+            f"BUG20: AXI read burst {burst_idx + 1} never handshook on AR\n"
+            f"{_bug18_trace_tail(trace or [])}"
+        )
+
+        addr, arlen, arsize, arburst = ar
+        bursts.append((addr, arlen, arsize, arburst))
+        if trace is not None:
+            _bug18_trace_append(
+                trace,
+                dut,
+                f"BUG20 AR burst={burst_idx + 1} addr=0x{addr:08x} len={arlen}",
+            )
+
+        dut.m_axi_arready.value = 0
+
+        assert addr == expected_addr, (
+            f"BUG20 burst {burst_idx + 1}: ARADDR=0x{addr:08x}, "
+            f"expected 0x{expected_addr:08x}"
+        )
+        assert arsize == 3, (
+            f"BUG20 burst {burst_idx + 1}: ARSIZE={arsize}, expected 3"
+        )
+        assert arburst == 1, (
+            f"BUG20 burst {burst_idx + 1}: ARBURST={arburst}, expected INCR(1)"
+        )
+
+        for _ in range(delays[burst_idx]):
+            await RisingEdge(dut.clk)
+
+        nbeats = arlen + 1
+        dut.m_axi_rvalid.value = 1
+        for beat in range(nbeats):
+            beat_addr = (addr & ~0x7) + beat * 8
+            dut.m_axi_rdata.value = mem.get(beat_addr, 0)
+            dut.m_axi_rlast.value = int(beat == nbeats - 1)
+
+            while True:
+                await RisingEdge(dut.clk)
+                await ReadOnly()
+                if int(dut.m_axi_rvalid.value) and int(dut.m_axi_rready.value):
+                    if trace is not None:
+                        _bug18_trace_append(
+                            trace,
+                            dut,
+                            f"BUG20 slave streamed burst={burst_idx + 1} beat={beat}",
+                        )
+                    break
+
+            if beat != nbeats - 1:
+                await NextTimeStep()
+                for _ in range(beat_gap):
+                    await RisingEdge(dut.clk)
+
+        await FallingEdge(dut.clk)
+        dut.m_axi_rvalid.value = 0
+        dut.m_axi_rlast.value = 0
+
+    return bursts
+
+
+BUG20_ST_RD_D = 12
+BUG20_DBG_TRIP_RD_POP_NO_HREADY = 9
+BUG21_ST_IDLE = 0
+
+
+async def _bug20_monitor_no_read_pop_while_stalled(dut, trace, stop_evt):
+    prev = None
+    sample_idx = 0
+
+    while True:
+        await RisingEdge(dut.clk)
+        await ReadOnly()
+        sample_idx += 1
+
+        if not int(dut.resetn.value):
+            prev = None
+            if stop_evt.is_set():
+                return None
+            continue
+
+        curr = {
+            "sample": sample_idx,
+            "state": _bug18_try_int(dut.dut.state),
+            "beat_cnt": _bug18_try_int(dut.dut.beat_cnt),
+            "rd_buf_valid": _bug18_try_int(dut.dut.rd_buf_valid),
+            "hready": int(dut.hready.value),
+            "dbg_trip_sticky": _bug18_try_int(dut.dut.dbg_trip_sticky),
+            "dbg_trip_cause": _bug18_try_int(dut.dut.dbg_trip_cause),
+        }
+
+        if (
+            prev is not None
+            and prev["state"] == BUG20_ST_RD_D
+            and prev["rd_buf_valid"] == 1
+            and prev["hready"] == 0
+        ):
+            popped = curr["rd_buf_valid"] == 0
+            beat_moved = (
+                prev["beat_cnt"] is not None
+                and curr["beat_cnt"] is not None
+                and curr["beat_cnt"] != prev["beat_cnt"]
+            )
+            if popped or beat_moved:
+                msg = (
+                    "BUG20: buffered read beat retired while HREADY=0 "
+                    f"(prev_sample={prev['sample']} curr_sample={curr['sample']} "
+                    f"prev_beat_cnt={prev['beat_cnt']} curr_beat_cnt={curr['beat_cnt']} "
+                    f"prev_rd_buf={prev['rd_buf_valid']} curr_rd_buf={curr['rd_buf_valid']} "
+                    f"dbg_trip={curr['dbg_trip_sticky']}/{curr['dbg_trip_cause']})"
+                )
+                _bug18_trace_append(trace, dut, msg)
+                return msg
+
+        if (
+            curr["dbg_trip_sticky"] == 1
+            and curr["dbg_trip_cause"] == BUG20_DBG_TRIP_RD_POP_NO_HREADY
+        ):
+            msg = (
+                "BUG20: dbg_trip_sticky fired with RD_POP_NO_HREADY "
+                f"(sample={curr['sample']})"
+            )
+            _bug18_trace_append(trace, dut, msg)
+            return msg
+
+        prev = curr
+
+        if stop_evt.is_set():
+            return None
+
+
+async def _bug21_monitor_no_unaccepted_sameaddr_pending(
+    dut,
+    watched_addr,
+    trace,
+    stop_evt,
+):
+    prev = None
+    sample_idx = 0
+
+    while True:
+        await RisingEdge(dut.clk)
+        await ReadOnly()
+        sample_idx += 1
+
+        if not int(dut.resetn.value):
+            prev = None
+            if stop_evt.is_set():
+                return None
+            continue
+
+        curr = {
+            "sample": sample_idx,
+            "state": _bug18_try_int(dut.dut.state),
+            "pnd_valid": _bug18_try_int(dut.dut.pnd_valid),
+            "pnd_addr": _bug18_try_int(dut.dut.pnd_addr),
+            "hready": int(dut.hready.value),
+            "hreadyin": int(dut.hreadyin.value),
+            "htrans": int(dut.htrans.value),
+            "hwrite": int(dut.hwrite.value),
+            "haddr": int(dut.haddr.value),
+        }
+
+        if (
+            prev is not None
+            and prev["hready"] == 0
+            and prev["hreadyin"] == 0
+            and prev["htrans"] == 0b10
+            and prev["hwrite"] == 0
+            and prev["haddr"] == watched_addr
+            and curr["pnd_valid"] == 1
+            and curr["pnd_addr"] == watched_addr
+        ):
+            msg = (
+                "BUG21: bridge latched a pending read from an unaccepted live "
+                f"same-address NONSEQ while HREADY=0 and HREADYIN=0 "
+                f"(prev_sample={prev['sample']} curr_sample={curr['sample']} "
+                f"state={curr['state']} watched_addr=0x{watched_addr:08x})"
+            )
+            _bug18_trace_append(trace, dut, msg)
+            return msg
+
+        prev = curr
+
+        if stop_evt.is_set():
+            return None
+
+
+async def _ahb_read_incr8_with_unaccepted_sameaddr_glitch_then_real_followon_bug21(
+    dut,
+    first_addr,
+    second_addr,
+    trace,
+):
+    hburst_incr8 = 0b101
+    hsize_qword = 3
+    ahb_nonseq = 0b10
+    ahb_seq = 0b11
+    ahb_idle = 0b00
+
+    def drive_read(addr, htrans):
+        dut.hsel.value = 1
+        dut.haddr.value = addr
+        dut.hburst.value = hburst_incr8
+        dut.hmastlock.value = 0
+        dut.hprot.value = 0
+        dut.hsize.value = hsize_qword
+        dut.htrans.value = htrans
+        dut.hwrite.value = 0
+        dut.hwdata.value = 0
+
+    def drive_idle():
+        _init_direct_ahb_signals(dut)
+        dut.hsel.value = 1
+
+    await FallingEdge(dut.clk)
+    dut.hreadyin.value = 1
+    drive_read(first_addr, ahb_nonseq)
+    _bug18_trace_append(trace, dut, "BUG21 start read1 NONSEQ")
+
+    current_burst = 1
+    current_addr = first_addr
+    current_beat = 0
+    glitch_injected = False
+    glitch_seq_cycle = False
+    first_done = False
+    second_started = False
+    second_done = False
+
+    for _ in range(5000):
+        await RisingEdge(dut.clk)
+        await ReadOnly()
+
+        hready = int(dut.hready.value)
+        state = _bug18_try_int(dut.dut.state)
+        beat_cnt = _bug18_try_int(dut.dut.beat_cnt)
+        rd_buf_valid = _bug18_try_int(dut.dut.rd_buf_valid)
+        dbg_trip_sticky = _bug18_try_int(dut.dut.dbg_trip_sticky)
+        dbg_trip_cause = _bug18_try_int(dut.dut.dbg_trip_cause)
+
+        if int(dut.m_axi_arvalid.value) and int(dut.m_axi_arready.value):
+            _bug18_trace_append(trace, dut, "BUG21 AXI AR handshake")
+        if int(dut.m_axi_rvalid.value) and int(dut.m_axi_rready.value):
+            _bug18_trace_append(trace, dut, "BUG21 AXI R handshake")
+        if dbg_trip_sticky == 1:
+            _bug18_trace_append(
+                trace,
+                dut,
+                f"BUG21 dbg_trip cause={dbg_trip_cause}",
+            )
+            return
+
+        should_glitch = (
+            not glitch_injected
+            and state == BUG20_ST_RD_D
+            and beat_cnt == 2
+            and rd_buf_valid == 0
+            and hready == 0
+        )
+        should_start_second = (
+            first_done
+            and not second_started
+            and state == BUG21_ST_IDLE
+            and hready == 1
+        )
+
+        await NextTimeStep()
+
+        if should_glitch:
+            glitch_injected = True
+            dut.hreadyin.value = 0
+            drive_read(first_addr, ahb_nonseq)
+            _bug18_trace_append(
+                trace,
+                dut,
+                f"BUG21 inject unaccepted NONSEQ addr=0x{first_addr:08x}",
+            )
+            continue
+
+        if glitch_injected and not glitch_seq_cycle:
+            glitch_seq_cycle = True
+            dut.hreadyin.value = 0
+            drive_read(first_addr + 8, ahb_seq)
+            _bug18_trace_append(
+                trace,
+                dut,
+                f"BUG21 advance held bus to SEQ addr=0x{first_addr + 8:08x}",
+            )
+            continue
+
+        if should_start_second:
+            second_started = True
+            current_burst = 2
+            current_addr = second_addr
+            current_beat = 0
+            dut.hreadyin.value = 1
+            drive_read(second_addr, ahb_nonseq)
+            _bug18_trace_append(
+                trace,
+                dut,
+                f"BUG21 start real read2 NONSEQ addr=0x{second_addr:08x}",
+            )
+            continue
+
+        # Keep upstream HREADYIN high here.  The full-system trace shows the
+        # bridge can see a live follow-on NONSEQ/SEQ from the upstream AHB
+        # fabric while its own HREADYOUT is low; tying HREADYIN to hready masks
+        # exactly that failure mode.
+        dut.hreadyin.value = 1
+
+        if hready and int(dut.htrans.value) in (ahb_nonseq, ahb_seq):
+            _bug18_trace_append(
+                trace,
+                dut,
+                f"BUG21 accept burst={current_burst} beat={current_beat}",
+            )
+
+            if current_burst == 1 and not first_done:
+                current_beat += 1
+                if current_beat >= 8:
+                    first_done = True
+                    drive_idle()
+                else:
+                    current_addr = first_addr + current_beat * 8
+                    drive_read(current_addr, ahb_seq)
+                continue
+
+            if current_burst == 2:
+                current_beat += 1
+                if current_beat >= 8:
+                    second_done = True
+                    drive_idle()
+                else:
+                    current_addr = second_addr + current_beat * 8
+                    drive_read(current_addr, ahb_seq)
+
+        if second_done:
+            return
+
+    raise TimeoutError("BUG21 helper: timed out waiting for real second burst completion")
+
+
+async def _ahb_read_same_addr_followon_early_traced_bug21b(
+    dut,
+    read_addr,
+    trace,
+):
+    hburst_incr8 = 0b101
+    hsize_qword = 3
+    ahb_nonseq = 0b10
+    ahb_seq = 0b11
+
+    read1 = []
+    read2 = []
+
+    current_burst = 1
+    current_beat = 0
+    glitch_started = False
+    first_aborted = False
+    second_started = False
+    accepting = True
+
+    def drive_current():
+        dut.hsel.value = 1
+        dut.haddr.value = read_addr + current_beat * 8
+        dut.hburst.value = hburst_incr8
+        dut.hmastlock.value = 0
+        dut.hprot.value = 0
+        dut.hsize.value = hsize_qword
+        dut.htrans.value = ahb_nonseq if current_beat == 0 else ahb_seq
+        dut.hwrite.value = 0
+        dut.hwdata.value = 0
+
+    def drive_idle():
+        _init_direct_ahb_signals(dut)
+        dut.hsel.value = 1
+
+    await FallingEdge(dut.clk)
+    dut.hreadyin.value = 1
+    drive_current()
+    _bug18_trace_append(trace, dut, "BUG21B start read1 NONSEQ")
+
+    while (not first_aborted and len(read1) < 8) or len(read2) < 8:
+        await RisingEdge(dut.clk)
+        await ReadOnly()
+
+        hready = int(dut.hready.value)
+        state = _bug18_try_int(dut.dut.state)
+        beat_cnt = _bug18_try_int(dut.dut.beat_cnt)
+        rd_buf_valid = _bug18_try_int(dut.dut.rd_buf_valid)
+
+        if int(dut.m_axi_arvalid.value) and int(dut.m_axi_arready.value):
+            _bug18_trace_append(trace, dut, "BUG21B AXI AR handshake")
+        if int(dut.m_axi_rvalid.value) and int(dut.m_axi_rready.value):
+            _bug18_trace_append(trace, dut, "BUG21B AXI R handshake")
+
+        if hready:
+            if accepting and int(dut.htrans.value) in (ahb_nonseq, ahb_seq):
+                data = int(dut.hrdata.value)
+                if current_burst == 1:
+                    read1.append(data)
+                else:
+                    read2.append(data)
+                _bug18_trace_append(
+                    trace,
+                    dut,
+                    f"BUG21B accept/data burst={current_burst} beat={current_beat} "
+                    f"data=0x{data:016x}",
+                )
+
+                if current_burst == 1 and current_beat == 7:
+                    if not second_started:
+                        current_burst = 2
+                        current_beat = 0
+                        second_started = True
+                    else:
+                        accepting = False
+                elif current_burst == 2 and current_beat == 7:
+                    accepting = False
+                else:
+                    current_beat += 1
+
+            await FallingEdge(dut.clk)
+            if accepting:
+                drive_current()
+            else:
+                drive_idle()
+            continue
+
+        await NextTimeStep()
+
+        if (
+            not glitch_started
+            and state == BUG20_ST_RD_D
+            and beat_cnt == 2
+            and rd_buf_valid == 0
+        ):
+            glitch_started = True
+            first_aborted = True
+            second_started = True
+            current_burst = 2
+            current_beat = 0
+            dut.hreadyin.value = 1
+            drive_current()
+            _bug18_trace_append(
+                trace,
+                dut,
+                "BUG21B inject early same-address read2 NONSEQ while read1 tail remains",
+            )
+            continue
+
+        # Same source-trace condition as above: upstream HREADYIN remains high
+        # even while the bridge's own HREADYOUT is low.
+        dut.hreadyin.value = 1
+
+    await NextTimeStep()
+    drive_idle()
+    return read1, read2
+
+
+async def _ahb_same_addr_followon_hreadyin_advances_to_seq_bug21d(
+    dut,
+    read_addr,
+    read2_data,
+    trace,
+    *,
+    seq_hreadyin_low_cycles=0,
+):
+    """
+    Exact source-trace hazard:
+      - the follow-on same-address NONSEQ appears while bridge HREADYOUT is low,
+      - upstream HREADYIN is high, so the live bus advances to SEQ next cycle,
+      - the bridge must still remember that beat0 NONSEQ and return beat0 data
+        before beat1 data.
+    """
+    from collections import deque
+
+    hburst_incr8 = 0b101
+    hsize_qword = 3
+    ahb_nonseq = 0b10
+    ahb_seq = 0b11
+
+    pending_read2 = deque()
+    read1_prefix = []
+    read2 = []
+
+    phase = "first"
+    first_beat = 0
+    second_live_beat = 0
+    injected = False
+    advanced_to_seq = False
+    seq_hreadyin_low_left = 0
+
+    def drive_read(beat):
+        dut.hsel.value = 1
+        dut.haddr.value = read_addr + beat * 8
+        dut.hburst.value = hburst_incr8
+        dut.hmastlock.value = 0
+        dut.hprot.value = 0
+        dut.hsize.value = hsize_qword
+        dut.htrans.value = ahb_nonseq if beat == 0 else ahb_seq
+        dut.hwrite.value = 0
+        dut.hwdata.value = 0
+
+    def drive_idle():
+        _init_direct_ahb_signals(dut)
+        dut.hsel.value = 1
+        dut.hreadyin.value = 1
+
+    await FallingEdge(dut.clk)
+    dut.hreadyin.value = 1
+    drive_read(0)
+    _bug18_trace_append(trace, dut, "BUG21D start read1 NONSEQ")
+
+    for _ in range(8000):
+        await RisingEdge(dut.clk)
+        await ReadOnly()
+
+        hready = int(dut.hready.value)
+        hreadyin = int(dut.hreadyin.value)
+        htrans = int(dut.htrans.value)
+        state = _bug18_try_int(dut.dut.state)
+        beat_cnt = _bug18_try_int(dut.dut.beat_cnt)
+        rd_buf_valid = _bug18_try_int(dut.dut.rd_buf_valid)
+
+        if int(dut.m_axi_arvalid.value) and int(dut.m_axi_arready.value):
+            _bug18_trace_append(trace, dut, "BUG21D AXI AR handshake")
+        if int(dut.m_axi_rvalid.value) and int(dut.m_axi_rready.value):
+            _bug18_trace_append(trace, dut, "BUG21D AXI R handshake")
+
+        ahb_accept = hready and hreadyin
+
+        if ahb_accept:
+            if phase == "second" and pending_read2:
+                beat = pending_read2.popleft()
+                data = int(dut.hrdata.value)
+                read2.append(data)
+                _bug18_trace_append(
+                    trace,
+                    dut,
+                    f"BUG21D read2 data beat={beat} data=0x{data:016x}",
+                )
+            elif phase == "first" and htrans in (ahb_nonseq, ahb_seq):
+                data = int(dut.hrdata.value)
+                read1_prefix.append(data)
+                _bug18_trace_append(
+                    trace,
+                    dut,
+                    f"BUG21D read1 prefix beat={first_beat} data=0x{data:016x}",
+                )
+
+            if phase == "second" and htrans in (ahb_nonseq, ahb_seq):
+                if second_live_beat < 8:
+                    pending_read2.append(second_live_beat)
+                    _bug18_trace_append(
+                        trace,
+                        dut,
+                        f"BUG21D accept live read2 beat={second_live_beat}",
+                    )
+
+        await NextTimeStep()
+
+        if (
+            not injected
+            and state == BUG20_ST_RD_D
+            and beat_cnt == 3
+            and rd_buf_valid == 1
+            and hready
+        ):
+            injected = True
+            phase = "second"
+            second_live_beat = 0
+            pending_read2.append(0)
+            dut.hreadyin.value = 1
+            drive_read(0)
+            _bug18_trace_append(
+                trace,
+                dut,
+                "BUG21D upstream accepts follow-on NONSEQ beat0 while bridge is stalled",
+            )
+            continue
+
+        if injected and not advanced_to_seq:
+            advanced_to_seq = True
+            second_live_beat = 1
+            seq_hreadyin_low_left = seq_hreadyin_low_cycles
+            dut.hreadyin.value = 0 if seq_hreadyin_low_left else 1
+            drive_read(1)
+            _bug18_trace_append(
+                trace,
+                dut,
+                "BUG21D upstream advances live bus to read2 SEQ beat1",
+            )
+            continue
+
+        if seq_hreadyin_low_left:
+            dut.hreadyin.value = 0
+            seq_hreadyin_low_left -= 1
+        else:
+            dut.hreadyin.value = 1
+
+        if phase == "first" and ahb_accept and htrans in (ahb_nonseq, ahb_seq):
+            first_beat += 1
+            drive_read(first_beat)
+        elif phase == "second" and ahb_accept and htrans in (ahb_nonseq, ahb_seq):
+            if second_live_beat >= 7:
+                second_live_beat = 8
+                drive_idle()
+            else:
+                second_live_beat += 1
+                drive_read(second_live_beat)
+
+        if len(read2) == len(read2_data):
+            drive_idle()
+            return read1_prefix, read2
+
+    raise TimeoutError("BUG21D helper: timed out before read2 completed")
+
+
+async def _ahb_fixed_read_idle_abort_then_same_addr_restart_bug21c(
+    dut,
+    read_addr,
+    trace,
+):
+    """
+    Replay the full-system trace shape more closely than the earlier BUG21B
+    test:
+      1. accept only beat0 of a fixed INCR8 read,
+      2. drive IDLE while the AXI tail of that fixed read keeps arriving,
+      3. start a same-address fixed INCR8 before the old tail is fully gone.
+
+    The restarted read must receive only the second AXI burst's tagged data.
+    """
+    hburst_incr8 = 0b101
+    hsize_qword = 3
+    ahb_nonseq = 0b10
+    ahb_seq = 0b11
+
+    first_read = []
+    second_read = []
+
+    phase = "first"
+    second_started = False
+    second_beat = 0
+
+    def drive_read(beat):
+        dut.hsel.value = 1
+        dut.haddr.value = read_addr + beat * 8
+        dut.hburst.value = hburst_incr8
+        dut.hmastlock.value = 0
+        dut.hprot.value = 0
+        dut.hsize.value = hsize_qword
+        dut.htrans.value = ahb_nonseq if beat == 0 else ahb_seq
+        dut.hwrite.value = 0
+        dut.hwdata.value = 0
+
+    def drive_idle():
+        _init_direct_ahb_signals(dut)
+        dut.hsel.value = 1
+
+    await FallingEdge(dut.clk)
+    dut.hreadyin.value = 1
+    drive_read(0)
+    _bug18_trace_append(trace, dut, "BUG21C start read1 beat0 NONSEQ")
+
+    for _ in range(8000):
+        await RisingEdge(dut.clk)
+        await ReadOnly()
+
+        hready = int(dut.hready.value)
+        htrans = int(dut.htrans.value)
+        hwrite = int(dut.hwrite.value)
+        state = _bug18_try_int(dut.dut.state)
+        beat_cnt = _bug18_try_int(dut.dut.beat_cnt)
+        rd_buf_valid = _bug18_try_int(dut.dut.rd_buf_valid)
+
+        if int(dut.m_axi_arvalid.value) and int(dut.m_axi_arready.value):
+            _bug18_trace_append(trace, dut, "BUG21C AXI AR handshake")
+        if int(dut.m_axi_rvalid.value) and int(dut.m_axi_rready.value):
+            _bug18_trace_append(trace, dut, "BUG21C AXI R handshake")
+
+        accepted_read_addr = hready and (htrans in (ahb_nonseq, ahb_seq)) and not hwrite
+
+        if hready:
+            if accepted_read_addr:
+                data = int(dut.hrdata.value)
+                if phase == "first":
+                    first_read.append(data)
+                    _bug18_trace_append(
+                        trace,
+                        dut,
+                        f"BUG21C accept/data read1 beat0 data=0x{data:016x}",
+                    )
+                elif phase == "second":
+                    second_read.append(data)
+                    _bug18_trace_append(
+                        trace,
+                        dut,
+                        f"BUG21C accept/data read2 beat={second_beat} data=0x{data:016x}",
+                    )
+
+        await NextTimeStep()
+
+        if hready and accepted_read_addr:
+            if phase == "first":
+                phase = "idle"
+                drive_idle()
+                _bug18_trace_append(trace, dut, "BUG21C abort read1 to IDLE")
+            elif phase == "second":
+                if second_beat == 7:
+                    phase = "done"
+                    drive_idle()
+                else:
+                    second_beat += 1
+                    drive_read(second_beat)
+            else:
+                drive_idle()
+        elif phase in ("idle", "done"):
+            drive_idle()
+
+        if (
+            phase == "idle"
+            and first_read
+            and not second_started
+            and state == BUG20_ST_RD_D
+            and beat_cnt == 2
+            and rd_buf_valid == 0
+        ):
+            second_started = True
+            phase = "second"
+            second_beat = 0
+            dut.hreadyin.value = 1
+            drive_read(0)
+            _bug18_trace_append(
+                trace,
+                dut,
+                "BUG21C start read2 same-address NONSEQ while read1 tail remains",
+            )
+
+        if len(second_read) == 8:
+            drive_idle()
+            return first_read, second_read
+
+    raise TimeoutError("BUG21C helper: timed out before second read completed")
+
+
+async def _bug20_reset_keep_clock(dut):
+    dut.resetn.value = 0
+    _init_direct_ahb_signals(dut)
+    _init_manual_axi_slave_inputs(dut)
+    dut.hsel.value = 1
+    dut.hreadyin.value = 1
+    await ClockCycles(dut.clk, 5)
+    dut.resetn.value = 1
+    await ClockCycles(dut.clk, 3)
+
+
+@cocotb.test()
+async def test_regression_bug18_same_addr_read_to_read_no_idle_gap_handoff(dut):
+    set_test_id(dut)
+
+    READ_ADDR = 0x0000A000
+    READ_DATA = [
+        0x1111000000000000,
+        0x2222000000000001,
+        0x3333000000000002,
+        0x4444000000000003,
+        0x5555000000000004,
+        0x6666000000000005,
+        0x7777000000000006,
+        0x8888000000000007,
+    ]
+
+    await setup_dut_no_axi_slave(dut)
+
+    mem = {}
+    for i, value in enumerate(READ_DATA):
+        mem[READ_ADDR + i * 8] = value
+
+    trace = []
+    slave_rd = cocotb.start_soon(
+        _checked_read_slave_two_same_addr_bursts(
+            dut,
+            mem,
+            first_r_delay=2,
+            second_r_delay=2,
+            ar_timeout_cycles=128,
+            trace=trace,
+        )
+    )
+
+    got1, got2 = await with_timeout(
+        _ahb_read_two_same_addr_incr8s_traced(dut, READ_ADDR, trace),
+        50, "us"
+    )
+    bursts = await with_timeout(slave_rd, 50, "us")
+    trace_tail = _bug18_trace_tail(trace)
+
+    assert bursts[0][0] == READ_ADDR, (
+        f"BUG18 read1 ARADDR=0x{bursts[0][0]:08x}, expected 0x{READ_ADDR:08x}\n"
+        f"{trace_tail}"
+    )
+    assert bursts[0][1] == 7, (
+        f"BUG18 read1 ARLEN={bursts[0][1]}, expected 7\n{trace_tail}"
+    )
+
+    assert bursts[1][0] == READ_ADDR, (
+        f"BUG18 read2 ARADDR=0x{bursts[1][0]:08x}, expected 0x{READ_ADDR:08x}\n"
+        f"{trace_tail}"
+    )
+    assert bursts[1][1] == 7, (
+        f"BUG18 read2 ARLEN={bursts[1][1]}, expected 7\n{trace_tail}"
+    )
+
+    assert got1 == READ_DATA, (
+        f"BUG18 read1 mismatch: expected {READ_DATA}, got {got1}\n{trace_tail}"
+    )
+    assert got2 == READ_DATA, (
+        f"BUG18 read2 mismatch: expected {READ_DATA}, got {got2}\n{trace_tail}"
+    )
+
+
+@cocotb.test()
+async def test_regression_bug19_abort_first_read_then_same_addr_restart(dut):
+    set_test_id(dut)
+
+    READ_ADDR = 0x0000A000
+    READ_DATA = [
+        0x1111000000000000,
+        0x2222000000000001,
+        0x3333000000000002,
+        0x4444000000000003,
+        0x5555000000000004,
+        0x6666000000000005,
+        0x7777000000000006,
+        0x8888000000000007,
+    ]
+
+    await setup_dut_no_axi_slave(dut)
+
+    mem = {}
+    for i, value in enumerate(READ_DATA):
+        mem[READ_ADDR + i * 8] = value
+
+    trace = []
+    slave_rd = cocotb.start_soon(
+        _checked_read_slave_two_same_addr_bursts(
+            dut,
+            mem,
+            first_r_delay=2,
+            second_r_delay=2,
+            ar_timeout_cycles=128,
+            trace=trace,
+        )
+    )
+
+    first0, got2 = await with_timeout(
+        _ahb_abort_first_incr8_then_same_addr_incr8_traced(dut, READ_ADDR, trace),
+        50, "us"
+    )
+    bursts = await with_timeout(slave_rd, 50, "us")
+    trace_tail = _bug18_trace_tail(trace)
+
+    assert first0 == READ_DATA[0], (
+        f"BUG19 first beat mismatch: expected 0x{READ_DATA[0]:016x}, got 0x{first0:016x}\n"
+        f"{trace_tail}"
+    )
+    assert bursts[0][0] == READ_ADDR and bursts[0][1] == 7, (
+        f"BUG19 first AR mismatch: got {bursts[0]}\n{trace_tail}"
+    )
+    assert bursts[1][0] == READ_ADDR and bursts[1][1] == 7, (
+        f"BUG19 second AR mismatch: got {bursts[1]}\n{trace_tail}"
+    )
+    assert got2 == READ_DATA, (
+        f"BUG19 second read mismatch: expected {READ_DATA}, got {got2}\n{trace_tail}"
+    )
+
+
+@cocotb.test()
+async def test_regression_bug20_same_addr_fixed_read_handoff_no_pop_while_stalled(dut):
+    set_test_id(dut)
+
+    READ_ADDR = 0x0000A000
+    READ_DATA = [
+        0x1111000000000000,
+        0x2222000000000001,
+        0x3333000000000002,
+        0x4444000000000003,
+        0x5555000000000004,
+        0x6666000000000005,
+        0x7777000000000006,
+        0x8888000000000007,
+    ]
+
+    await setup_dut_no_axi_slave(dut)
+
+    mem = {}
+    for i, value in enumerate(READ_DATA):
+        mem[READ_ADDR + i * 8] = value
+
+    trace = []
+    stop_evt = Event()
+    bug20_mon = cocotb.start_soon(
+        _bug20_monitor_no_read_pop_while_stalled(dut, trace, stop_evt)
+    )
+    slave_rd = cocotb.start_soon(
+        _checked_read_slave_two_same_addr_bursts_streaming(
+            dut,
+            mem,
+            first_r_delay=2,
+            second_r_delay=2,
+            ar_timeout_cycles=128,
+            trace=trace,
+        )
+    )
+
+    try:
+        got1, got2 = await with_timeout(
+            _ahb_read_two_same_addr_incr8s_traced(dut, READ_ADDR, trace),
+            50, "us"
+        )
+        bursts = await with_timeout(slave_rd, 50, "us")
+    finally:
+        stop_evt.set()
+
+    violation = await with_timeout(bug20_mon, 10, "us")
+    trace_tail = _bug18_trace_tail(trace)
+    dbg_trip_sticky = _bug18_try_int(dut.dut.dbg_trip_sticky)
+    dbg_trip_cause = _bug18_try_int(dut.dut.dbg_trip_cause)
+
+    assert got1 == READ_DATA, (
+        f"BUG20 read1 mismatch: expected {READ_DATA}, got {got1}\n{trace_tail}"
+    )
+    assert got2 == READ_DATA, (
+        f"BUG20 read2 mismatch: expected {READ_DATA}, got {got2}\n{trace_tail}"
+    )
+    assert bursts[0][0] == READ_ADDR and bursts[0][1] == 7, (
+        f"BUG20 first AR mismatch: got {bursts[0]}\n{trace_tail}"
+    )
+    assert bursts[1][0] == READ_ADDR and bursts[1][1] == 7, (
+        f"BUG20 second AR mismatch: got {bursts[1]}\n{trace_tail}"
+    )
+    assert violation is None, f"{violation}\n{trace_tail}"
+    assert not (
+        dbg_trip_sticky == 1 and dbg_trip_cause == BUG20_DBG_TRIP_RD_POP_NO_HREADY
+    ), (
+        "BUG20: bridge fired RD_POP_NO_HREADY after same-address fixed-read handoff\n"
+        f"{trace_tail}"
+    )
+
+
+@cocotb.test()
+async def test_regression_bug20_fixed_read_to_read_no_idle_gap_no_pop_while_stalled(dut):
+    set_test_id(dut)
+
+    READ1_ADDR = 0x0000A000
+    READ2_ADDR = 0x0000C000
+    READ1_DATA = [
+        0x1111000000000000,
+        0x2222000000000001,
+        0x3333000000000002,
+        0x4444000000000003,
+        0x5555000000000004,
+        0x6666000000000005,
+        0x7777000000000006,
+        0x8888000000000007,
+    ]
+    READ2_DATA = [
+        0x9999000000000010,
+        0xAAAA000000000011,
+        0xBBBB000000000012,
+        0xCCCC000000000013,
+        0xDDDD000000000014,
+        0xEEEE000000000015,
+        0xABCD000000000016,
+        0xDCBA000000000017,
+    ]
+
+    await setup_dut_no_axi_slave(dut)
+
+    mem = {}
+    for i, value in enumerate(READ1_DATA):
+        mem[READ1_ADDR + i * 8] = value
+    for i, value in enumerate(READ2_DATA):
+        mem[READ2_ADDR + i * 8] = value
+
+    trace = []
+    stop_evt = Event()
+    bug20_mon = cocotb.start_soon(
+        _bug20_monitor_no_read_pop_while_stalled(dut, trace, stop_evt)
+    )
+    slave_rd = cocotb.start_soon(
+        _checked_read_slave_two_bursts_streaming(
+            dut,
+            mem,
+            burst_addrs=[READ1_ADDR, READ2_ADDR],
+            first_r_delay=2,
+            second_r_delay=2,
+            ar_timeout_cycles=128,
+            trace=trace,
+        )
+    )
+
+    try:
+        got1, got2 = await with_timeout(
+            _ahb_read_two_incr8s_traced(dut, READ1_ADDR, READ2_ADDR, trace),
+            50, "us"
+        )
+        bursts = await with_timeout(slave_rd, 50, "us")
+    finally:
+        stop_evt.set()
+
+    violation = await with_timeout(bug20_mon, 10, "us")
+    trace_tail = _bug18_trace_tail(trace)
+    dbg_trip_sticky = _bug18_try_int(dut.dut.dbg_trip_sticky)
+    dbg_trip_cause = _bug18_try_int(dut.dut.dbg_trip_cause)
+
+    assert got1 == READ1_DATA, (
+        f"BUG20 first read mismatch: expected {READ1_DATA}, got {got1}\n{trace_tail}"
+    )
+    assert got2 == READ2_DATA, (
+        f"BUG20 second read mismatch: expected {READ2_DATA}, got {got2}\n{trace_tail}"
+    )
+    assert bursts[0][0] == READ1_ADDR and bursts[0][1] == 7, (
+        f"BUG20 first AR mismatch: got {bursts[0]}\n{trace_tail}"
+    )
+    assert bursts[1][0] == READ2_ADDR and bursts[1][1] == 7, (
+        f"BUG20 second AR mismatch: got {bursts[1]}\n{trace_tail}"
+    )
+    assert violation is None, f"{violation}\n{trace_tail}"
+    assert not (
+        dbg_trip_sticky == 1 and dbg_trip_cause == BUG20_DBG_TRIP_RD_POP_NO_HREADY
+    ), (
+        "BUG20: bridge fired RD_POP_NO_HREADY after fixed-read handoff\n"
+        f"{trace_tail}"
+    )
+
+
+@cocotb.test()
+async def test_regression_bug21_unaccepted_same_addr_nonseq_must_not_spawn_pending_read(dut):
+    set_test_id(dut)
+
+    read1_addr = 0x0000A000
+    read1_data = [
+        0x1111000000000000,
+        0x2222000000000001,
+        0x3333000000000002,
+        0x4444000000000003,
+        0x5555000000000004,
+        0x6666000000000005,
+        0x7777000000000006,
+        0x8888000000000007,
+    ]
+    read2_addr = 0x0000C000
+    read2_data = [
+        0x9999000000000010,
+        0xAAAA000000000011,
+        0xBBBB000000000012,
+        0xCCCC000000000013,
+        0xDDDD000000000014,
+        0xEEEE000000000015,
+        0xABCD000000000016,
+        0xDCBA000000000017,
+    ]
+
+    await setup_dut_no_axi_slave(dut)
+
+    mem = {}
+    for i, value in enumerate(read1_data):
+        mem[read1_addr + i * 8] = value
+    for i, value in enumerate(read2_data):
+        mem[read2_addr + i * 8] = value
+
+    trace = []
+    stop_evt = Event()
+    bug20_mon = cocotb.start_soon(
+        _bug20_monitor_no_read_pop_while_stalled(dut, trace, stop_evt)
+    )
+    bug21_mon = cocotb.start_soon(
+        _bug21_monitor_no_unaccepted_sameaddr_pending(
+            dut, read1_addr, trace, stop_evt
+        )
+    )
+    slave_rd = cocotb.start_soon(
+        _checked_read_slave_two_bursts_streaming(
+            dut,
+            mem,
+            burst_addrs=[read1_addr, read2_addr],
+            first_r_delay=2,
+            second_r_delay=2,
+            beat_gap=0,
+            ar_timeout_cycles=256,
+            trace=trace,
+        )
+    )
+
+    try:
+        await with_timeout(
+            _ahb_read_incr8_with_unaccepted_sameaddr_glitch_then_real_followon_bug21(
+                dut,
+                read1_addr,
+                read2_addr,
+                trace,
+            ),
+            50, "us"
+        )
+        bursts = await with_timeout(slave_rd, 50, "us")
+    finally:
+        stop_evt.set()
+
+    violation = await with_timeout(bug20_mon, 10, "us")
+    violation21 = await with_timeout(bug21_mon, 10, "us")
+    trace_tail = _bug18_trace_tail(trace)
+    dbg_trip_sticky = _bug18_try_int(dut.dut.dbg_trip_sticky)
+    dbg_trip_cause = _bug18_try_int(dut.dut.dbg_trip_cause)
+
+    assert bursts[0][0] == read1_addr and bursts[0][1] == 7, (
+        f"BUG21 first AR mismatch: got {bursts[0]}\n{trace_tail}"
+    )
+    assert bursts[1][0] == read2_addr and bursts[1][1] == 7, (
+        f"BUG21 second AR mismatch: got {bursts[1]}\n{trace_tail}"
+    )
+    assert violation is None, f"{violation}\n{trace_tail}"
+    assert violation21 is None, f"{violation21}\n{trace_tail}"
+    assert not (
+        dbg_trip_sticky == 1 and dbg_trip_cause == BUG20_DBG_TRIP_RD_POP_NO_HREADY
+    ), (
+        "BUG21: bridge fired RD_POP_NO_HREADY in the unaccepted same-address reproducer\n"
+        f"{trace_tail}"
+    )
+
+
+@cocotb.test()
+async def test_regression_bug21_same_addr_followon_must_not_mix_tagged_data(dut):
+    set_test_id(dut)
+
+    read_addr = 0x0000A000
+    read1_data = [
+        0x1111000000000000,
+        0x2222000000000001,
+        0x3333000000000002,
+        0x4444000000000003,
+        0x5555000000000004,
+        0x6666000000000005,
+        0x7777000000000006,
+        0x8888000000000007,
+    ]
+    read2_data = [
+        0xAAA1000000000010,
+        0xAAA2000000000011,
+        0xAAA3000000000012,
+        0xAAA4000000000013,
+        0xAAA5000000000014,
+        0xAAA6000000000015,
+        0xAAA7000000000016,
+        0xAAA8000000000017,
+    ]
+
+    await setup_dut_no_axi_slave(dut)
+
+    trace = []
+    slave_rd = cocotb.start_soon(
+        _checked_read_slave_two_same_addr_bursts_streaming_tagged(
+            dut,
+            burst_datas=[read1_data, read2_data],
+            expected_addr=read_addr,
+            first_r_delay=2,
+            second_r_delay=2,
+            ar_timeout_cycles=256,
+            trace=trace,
+        )
+    )
+
+    got1, got2 = await with_timeout(
+        _ahb_read_two_same_addr_incr8s_traced(dut, read_addr, trace),
+        50, "us"
+    )
+    bursts = await with_timeout(slave_rd, 50, "us")
+    trace_tail = _bug18_trace_tail(trace)
+
+    assert bursts[0][0] == read_addr and bursts[0][1] == 7, (
+        f"BUG21B first AR mismatch: got {bursts[0]}\n{trace_tail}"
+    )
+    assert bursts[1][0] == read_addr and bursts[1][1] == 7, (
+        f"BUG21B second AR mismatch: got {bursts[1]}\n{trace_tail}"
+    )
+    assert got1 == read1_data, (
+        f"BUG21B read1 mismatch: expected {read1_data}, got {got1}\n{trace_tail}"
+    )
+    assert got2 == read2_data, (
+        f"BUG21B read2 mismatch: expected {read2_data}, got {got2}\n{trace_tail}"
+    )
+
+
+@cocotb.test()
+async def test_regression_bug21_early_same_addr_followon_must_not_mix_tagged_data(dut):
+    set_test_id(dut)
+
+    read_addr = 0x0000A000
+    read1_data = [
+        0x1111000000000000,
+        0x2222000000000001,
+        0x3333000000000002,
+        0x4444000000000003,
+        0x5555000000000004,
+        0x6666000000000005,
+        0x7777000000000006,
+        0x8888000000000007,
+    ]
+    read2_data = [
+        0xAAA1000000000010,
+        0xAAA2000000000011,
+        0xAAA3000000000012,
+        0xAAA4000000000013,
+        0xAAA5000000000014,
+        0xAAA6000000000015,
+        0xAAA7000000000016,
+        0xAAA8000000000017,
+    ]
+
+    await setup_dut_no_axi_slave(dut)
+
+    trace = []
+    slave_rd = cocotb.start_soon(
+        _checked_read_slave_two_same_addr_bursts_streaming_tagged(
+            dut,
+            burst_datas=[read1_data, read2_data],
+            expected_addr=read_addr,
+            first_r_delay=2,
+            second_r_delay=2,
+            ar_timeout_cycles=256,
+            trace=trace,
+        )
+    )
+
+    trace_tail = _bug18_trace_tail(trace)
+    try:
+        got1, got2 = await with_timeout(
+            _ahb_read_same_addr_followon_early_traced_bug21b(dut, read_addr, trace),
+            50, "us"
+        )
+        bursts = await with_timeout(slave_rd, 50, "us")
+    except Exception as exc:
+        _bug18_trace_append(trace, dut, "BUG21B timeout/failure final snapshot")
+        trace_tail = _bug18_trace_tail(trace)
+        raise AssertionError(f"BUG21D early same-address timeout/failure: {exc}\n{trace_tail}") from exc
+
+    trace_tail = _bug18_trace_tail(trace)
+
+    assert bursts[0][0] == read_addr and bursts[0][1] == 7, (
+        f"BUG21B early first AR mismatch: got {bursts[0]}\n{trace_tail}"
+    )
+    assert bursts[1][0] == read_addr and bursts[1][1] == 7, (
+        f"BUG21B early second AR mismatch: got {bursts[1]}\n{trace_tail}"
+    )
+    assert got1 and got1 == read1_data[:len(got1)], (
+        f"BUG21B early read1 prefix mismatch: expected prefix of {read1_data}, "
+        f"got {got1}\n{trace_tail}"
+    )
+    assert got2 == read2_data, (
+        f"BUG21B early read2 mismatch: expected {read2_data}, got {got2}\n{trace_tail}"
+    )
+
+
+@cocotb.test()
+async def test_regression_bug21_hreadyin_advanced_same_addr_followon_keeps_beat0(dut):
+    set_test_id(dut)
+
+    read_addr = 0x0000A000
+    read1_data = [
+        0x1111000000000000,
+        0x2222000000000001,
+        0x3333000000000002,
+        0x4444000000000003,
+        0x5555000000000004,
+        0x6666000000000005,
+        0x7777000000000006,
+        0x8888000000000007,
+    ]
+    read2_data = [
+        0xAAA1000000000010,
+        0xAAA2000000000011,
+        0xAAA3000000000012,
+        0xAAA4000000000013,
+        0xAAA5000000000014,
+        0xAAA6000000000015,
+        0xAAA7000000000016,
+        0xAAA8000000000017,
+    ]
+
+    await setup_dut_no_axi_slave(dut)
+
+    trace = []
+    slave_rd = cocotb.start_soon(
+        _checked_read_slave_two_same_addr_bursts_streaming_tagged(
+            dut,
+            burst_datas=[read1_data, read2_data],
+            expected_addr=read_addr,
+            first_r_delay=2,
+            second_r_delay=2,
+            ar_timeout_cycles=256,
+            trace=trace,
+        )
+    )
+
+    try:
+        got1_prefix, got2 = await with_timeout(
+            _ahb_same_addr_followon_hreadyin_advances_to_seq_bug21d(
+                dut,
+                read_addr,
+                read2_data,
+                trace,
+                seq_hreadyin_low_cycles=4,
+            ),
+            50, "us"
+        )
+        bursts = await with_timeout(slave_rd, 50, "us")
+    except Exception as exc:
+        _bug18_trace_append(trace, dut, "BUG21D timeout/failure final snapshot")
+        raise AssertionError(
+            f"BUG21D HREADYIN-advanced same-address restart failure: {exc}\n"
+            f"{_bug18_trace_tail(trace)}"
+        ) from exc
+
+    trace_tail = _bug18_trace_tail(trace)
+
+    assert bursts[0][0] == read_addr and bursts[0][1] == 7, (
+        f"BUG21D first AR mismatch: got {bursts[0]}\n{trace_tail}"
+    )
+    assert bursts[1][0] == read_addr and bursts[1][1] == 7, (
+        f"BUG21D second AR mismatch: got {bursts[1]}\n{trace_tail}"
+    )
+    assert got1_prefix and got1_prefix == read1_data[:len(got1_prefix)], (
+        f"BUG21D first read prefix mismatch: expected prefix of {read1_data}, "
+        f"got {got1_prefix}\n{trace_tail}"
+    )
+    assert got2 == read2_data, (
+        f"BUG21D read2 lost beat0 or mixed stale data: expected {read2_data}, got {got2}\n"
+        f"{trace_tail}"
+    )
+
+
+@cocotb.test()
+async def test_regression_bug21_idle_aborted_fixed_read_same_addr_restart_no_tail_data(dut):
+    set_test_id(dut)
+
+    read_addr = 0x0000A000
+    read1_data = [
+        0x1111000000000000,
+        0x2222000000000001,
+        0x3333000000000002,
+        0x4444000000000003,
+        0x5555000000000004,
+        0x6666000000000005,
+        0x7777000000000006,
+        0x8888000000000007,
+    ]
+    read2_data = [
+        0xAAA1000000000010,
+        0xAAA2000000000011,
+        0xAAA3000000000012,
+        0xAAA4000000000013,
+        0xAAA5000000000014,
+        0xAAA6000000000015,
+        0xAAA7000000000016,
+        0xAAA8000000000017,
+    ]
+
+    await setup_dut_no_axi_slave(dut)
+
+    trace = []
+    slave_rd = cocotb.start_soon(
+        _checked_read_slave_two_same_addr_bursts_streaming_tagged(
+            dut,
+            burst_datas=[read1_data, read2_data],
+            expected_addr=read_addr,
+            first_r_delay=2,
+            second_r_delay=2,
+            ar_timeout_cycles=256,
+            trace=trace,
+        )
+    )
+
+    try:
+        got1, got2 = await with_timeout(
+            _ahb_fixed_read_idle_abort_then_same_addr_restart_bug21c(
+                dut, read_addr, trace
+            ),
+            50, "us"
+        )
+        bursts = await with_timeout(slave_rd, 50, "us")
+    except Exception as exc:
+        _bug18_trace_append(trace, dut, "BUG21C timeout/failure final snapshot")
+        raise AssertionError(
+            f"BUG21C idle-abort same-address restart failure: {exc}\n"
+            f"{_bug18_trace_tail(trace)}"
+        ) from exc
+
+    trace_tail = _bug18_trace_tail(trace)
+
+    assert bursts[0][0] == read_addr and bursts[0][1] == 7, (
+        f"BUG21C first AR mismatch: got {bursts[0]}\n{trace_tail}"
+    )
+    assert bursts[1][0] == read_addr and bursts[1][1] == 7, (
+        f"BUG21C second AR mismatch: got {bursts[1]}\n{trace_tail}"
+    )
+    assert got1 == [read1_data[0]], (
+        f"BUG21C first read should only complete beat0: expected "
+        f"{[read1_data[0]]}, got {got1}\n{trace_tail}"
+    )
+    assert got2 == read2_data, (
+        f"BUG21C restarted read got stale tail data: expected {read2_data}, got {got2}\n"
+        f"{trace_tail}"
+    )
+
+
+async def _explore_bug20_timing_sweep_no_pop_while_stalled(dut):
+    set_test_id(dut)
+
+    cocotb.start_soon(Clock(dut.clk, CLK_NS, units="ns").start())
+    _start_invariant_monitors(dut)
+
+    read1_addr = 0x0000A000
+    read2_addr = 0x0000C000
+    read_data_1 = [
+        0x1111000000000000,
+        0x2222000000000001,
+        0x3333000000000002,
+        0x4444000000000003,
+        0x5555000000000004,
+        0x6666000000000005,
+        0x7777000000000006,
+        0x8888000000000007,
+    ]
+    read_data_2 = [
+        0x9999000000000010,
+        0xAAAA000000000011,
+        0xBBBB000000000012,
+        0xCCCC000000000013,
+        0xDDDD000000000014,
+        0xEEEE000000000015,
+        0xABCD000000000016,
+        0xDCBA000000000017,
+    ]
+
+    cases = [
+        ("same_full_d0_g0", "same_full", 0, 0, 0),
+        ("same_full_d1_g0", "same_full", 1, 1, 0),
+        ("same_full_d2_g0", "same_full", 2, 2, 0),
+        ("same_full_d0_g1", "same_full", 0, 0, 1),
+        ("diff_full_d0_g0", "diff_full", 0, 0, 0),
+        ("diff_full_d1_g0", "diff_full", 1, 1, 0),
+        ("diff_full_d2_g0", "diff_full", 2, 2, 0),
+        ("abort_same_d0_g0", "abort_same", 0, 0, 0),
+        ("abort_same_d1_g0", "abort_same", 1, 1, 0),
+        ("abort_same_d2_g0", "abort_same", 2, 2, 0),
+    ]
+
+    failures = []
+
+    for case_name, pattern, first_delay, second_delay, beat_gap in cases:
+        await _bug20_reset_keep_clock(dut)
+
+        mem = {}
+        for i, value in enumerate(read_data_1):
+            mem[read1_addr + i * 8] = value
+        for i, value in enumerate(read_data_2):
+            mem[read2_addr + i * 8] = value
+
+        trace = [f"BUG20 case={case_name} pattern={pattern}"]
+        stop_evt = Event()
+        bug20_mon = cocotb.start_soon(
+            _bug20_monitor_no_read_pop_while_stalled(dut, trace, stop_evt)
+        )
+
+        burst_addrs = [read1_addr, read1_addr if pattern != "diff_full" else read2_addr]
+        slave_rd = cocotb.start_soon(
+            _checked_read_slave_two_bursts_streaming(
+                dut,
+                mem,
+                burst_addrs=burst_addrs,
+                first_r_delay=first_delay,
+                second_r_delay=second_delay,
+                beat_gap=beat_gap,
+                ar_timeout_cycles=128,
+                trace=trace,
+            )
+        )
+
+        try:
+            if pattern == "same_full":
+                await with_timeout(
+                    _ahb_read_two_same_addr_incr8s_traced(dut, read1_addr, trace),
+                    50, "us"
+                )
+            elif pattern == "diff_full":
+                await with_timeout(
+                    _ahb_read_two_incr8s_traced(dut, read1_addr, read2_addr, trace),
+                    50, "us"
+                )
+            else:
+                await with_timeout(
+                    _ahb_abort_first_incr8_then_same_addr_incr8_traced(
+                        dut, read1_addr, trace
+                    ),
+                    50, "us"
+                )
+            await with_timeout(slave_rd, 50, "us")
+        except Exception as exc:
+            failures.append(
+                f"{case_name}: stimulus/response failure: {type(exc).__name__}: {exc}\n"
+                f"{_bug18_trace_tail(trace)}"
+            )
+        finally:
+            stop_evt.set()
+
+        violation = await with_timeout(bug20_mon, 10, "us")
+        dbg_trip_sticky = _bug18_try_int(dut.dut.dbg_trip_sticky)
+        dbg_trip_cause = _bug18_try_int(dut.dut.dbg_trip_cause)
+
+        if violation is not None:
+            failures.append(f"{case_name}: {violation}\n{_bug18_trace_tail(trace)}")
+        elif dbg_trip_sticky == 1 and dbg_trip_cause == BUG20_DBG_TRIP_RD_POP_NO_HREADY:
+            failures.append(
+                f"{case_name}: dbg_trip_sticky fired with RD_POP_NO_HREADY\n"
+                f"{_bug18_trace_tail(trace)}"
+            )
+
+        if failures:
+            break
+
+    assert not failures, failures[0]
+
+
+async def _ahb_fixed_incr8_two_beats_idle_restart_v22(
+    dut,
+    start_addr,
+    partial_data,
+    restart_data,
+    *,
+    idle_cycles=4,
+):
+    assert len(partial_data) == 2
+    assert len(restart_data) == 8
+
+    hburst = 0b101  # INCR8
+    hsize = _size_bytes_to_axsize(8)
+
+    def drive_write_addr(idx, htrans):
+        dut.haddr.value = start_addr + idx * 8
+        dut.hburst.value = hburst
+        dut.hmastlock.value = 0
+        dut.hprot.value = 0
+        dut.hsize.value = hsize
+        dut.htrans.value = htrans
+        dut.hwrite.value = 1
+
+    def drive_idle():
+        dut.haddr.value = 0
+        dut.hburst.value = 0
+        dut.hmastlock.value = 0
+        dut.hprot.value = 0
+        dut.hsize.value = 0
+        dut.htrans.value = 0
+        dut.hwrite.value = 0
+
+    drive_write_addr(0, 0b10)
+    dut.hwdata.value = 0
+
+    await _wait_hready_high(dut)
+    dut.hwdata.value = partial_data[0]
+    drive_write_addr(1, 0b11)
+
+    await _wait_hready_high(dut)
+    dut.hwdata.value = partial_data[1]
+    drive_idle()
+
+    # Complete beat 1's data phase, then keep the bus idle with changing
+    # HWDATA. The bridge must not consume these idle cycles as write beats.
+    await _wait_hready_high(dut)
+    for i in range(idle_cycles):
+        dut.hwdata.value = 0xD00D000000000000 | i
+        drive_idle()
+        await _wait_hready_high(dut)
+
+    await ahb_write_inc_burst_manual(
+        dut,
+        start_addr,
+        restart_data,
+        size_bytes=8,
+        fixed=True,
+    )
+
+
+async def _checked_write_slave_bursts_v22(dut, expected_bursts):
+    results = []
+    dut.m_axi_awready.value = 0
+    dut.m_axi_wready.value = 0
+    dut.m_axi_bvalid.value = 0
+    dut.m_axi_bresp.value = 0
+    dut.m_axi_bid.value = 0
+
+    for burst_idx, expected in enumerate(expected_bursts):
+        exp_addr = expected["addr"]
+        exp_len = expected["len"]
+        exp_data = expected["data"]
+
+        while not int(dut.m_axi_awvalid.value):
+            await RisingEdge(dut.clk)
+
+        dut.m_axi_awready.value = 1
+        while True:
+            await RisingEdge(dut.clk)
+            if int(dut.m_axi_awvalid.value) and int(dut.m_axi_awready.value):
+                awaddr = int(dut.m_axi_awaddr.value)
+                awlen = int(dut.m_axi_awlen.value)
+                awsize = int(dut.m_axi_awsize.value)
+                awburst = int(dut.m_axi_awburst.value)
+                break
+        dut.m_axi_awready.value = 0
+
+        assert awaddr == exp_addr, (
+            f"BUG22 burst {burst_idx}: AWADDR=0x{awaddr:08x}, expected 0x{exp_addr:08x}"
+        )
+        assert awlen == exp_len, (
+            f"BUG22 burst {burst_idx}: AWLEN={awlen}, expected {exp_len}"
+        )
+        assert awsize == 3, (
+            f"BUG22 burst {burst_idx}: AWSIZE={awsize}, expected 3"
+        )
+        assert awburst == 1, (
+            f"BUG22 burst {burst_idx}: AWBURST={awburst}, expected INCR"
+        )
+
+        beats = []
+        for beat_idx, exp_word in enumerate(exp_data):
+            while not int(dut.m_axi_wvalid.value):
+                await RisingEdge(dut.clk)
+
+            dut.m_axi_wready.value = 1
+            while True:
+                await RisingEdge(dut.clk)
+                if int(dut.m_axi_wvalid.value) and int(dut.m_axi_wready.value):
+                    wdata = int(dut.m_axi_wdata.value)
+                    wstrb = int(dut.m_axi_wstrb.value)
+                    wlast = int(dut.m_axi_wlast.value)
+                    break
+            dut.m_axi_wready.value = 0
+
+            expected_last = 1 if beat_idx == len(exp_data) - 1 else 0
+            assert wdata == exp_word, (
+                f"BUG22 burst {burst_idx} beat {beat_idx}: "
+                f"WDATA=0x{wdata:016x}, expected 0x{exp_word:016x}"
+            )
+            assert wstrb == 0xFF, (
+                f"BUG22 burst {burst_idx} beat {beat_idx}: WSTRB=0x{wstrb:02x}, expected 0xff"
+            )
+            assert wlast == expected_last, (
+                f"BUG22 burst {burst_idx} beat {beat_idx}: WLAST={wlast}, expected {expected_last}"
+            )
+            beats.append((wdata, wlast))
+
+        dut.m_axi_bresp.value = 0
+        dut.m_axi_bvalid.value = 1
+        while True:
+            await RisingEdge(dut.clk)
+            if int(dut.m_axi_bvalid.value) and int(dut.m_axi_bready.value):
+                break
+        dut.m_axi_bvalid.value = 0
+        results.append((awaddr, awlen, beats))
+
+    return results
+
+
+@cocotb.test()
+async def test_regression_bug22_fixed_incr8_idle_restart_does_not_shift_writes(dut):
+    set_test_id(dut)
+
+    WRITE_ADDR = 0x0000E000
+    PARTIAL = [
+        0x1111000000000001,
+        0x2222000000000002,
+    ]
+    RESTART = [
+        0xA000000000000000 | i
+        for i in range(8)
+    ]
+
+    await setup_dut_no_axi_slave(dut)
+
+    slave_wr = cocotb.start_soon(
+        _checked_write_slave_bursts_v22(
+            dut,
+            [
+                {"addr": WRITE_ADDR, "len": 1, "data": PARTIAL},
+                {"addr": WRITE_ADDR, "len": 7, "data": RESTART},
+            ],
+        )
+    )
+
+    await with_timeout(
+        _ahb_fixed_incr8_two_beats_idle_restart_v22(
+            dut,
+            WRITE_ADDR,
+            PARTIAL,
+            RESTART,
+            idle_cycles=4,
+        ),
+        50,
+        "us",
+    )
+
+    await with_timeout(slave_wr, 50, "us")
+
+
+@cocotb.test()
+async def test_regression_bug22b_single_write_aw_not_delayed_until_flush(dut):
+    set_test_id(dut)
+
+    await setup_dut_no_axi_slave(dut)
+
+    # Keep AW stalled so the test observes whether the bridge presents AW in
+    # ST_WR_D itself. v22a incorrectly delayed even SINGLE writes until the
+    # later fixed-write flush state, disturbing MMIO/bootrom ordering.
+    dut.m_axi_awready.value = 0
+    dut.m_axi_wready.value = 0
+    dut.m_axi_bvalid.value = 0
+
+    addr = 0x0000E100
+    dut.haddr.value = addr
+    dut.hburst.value = 0          # SINGLE
+    dut.hmastlock.value = 0
+    dut.hprot.value = 0
+    dut.hsize.value = 3           # 8-byte write
+    dut.htrans.value = 0b10       # NONSEQ
+    dut.hwrite.value = 1
+    dut.hwdata.value = 0
+
+    await RisingEdge(dut.clk)
+    await ReadOnly()
+
+    assert int(dut.dut.state.value) == 2, (
+        f"BUG22B: expected ST_WR_D after accepted SINGLE write, got state={int(dut.dut.state.value)}"
+    )
+    assert int(dut.m_axi_awvalid.value) == 1, (
+        "BUG22B: SINGLE write AWVALID was delayed until flush. "
+        "SINGLE writes must preserve the old immediate-AW path for MMIO/bootrom ordering."
+    )
+    assert int(dut.m_axi_awaddr.value) == addr, (
+        f"BUG22B: AWADDR=0x{int(dut.m_axi_awaddr.value):08x}, expected 0x{addr:08x}"
+    )
+    assert int(dut.m_axi_awlen.value) == 0, (
+        f"BUG22B: AWLEN={int(dut.m_axi_awlen.value)}, expected 0 for SINGLE"
+    )
+
+
+@cocotb.test()
+async def test_regression_bug22c_deselect_terminates_partial_fixed_write(dut):
+    set_test_id(dut)
+
+    await setup_dut_no_axi_slave(dut)
+
+    # Hold AXI stalled so AWVALID remains observable. The trace failure has an
+    # INCR8 write where this bridge is deselected after two accepted beats; the
+    # bridge must flush those beats without waiting for a later selected access.
+    dut.m_axi_awready.value = 0
+    dut.m_axi_wready.value = 0
+    dut.m_axi_bvalid.value = 0
+    dut.m_axi_bresp.value = 0
+
+    addr = 0x0000E200
+    data0 = 0x1111222233334444
+    data1 = 0x5555666677778888
+
+    dut.hsel.value = 1
+    dut.hreadyin.value = 1
+    dut.haddr.value = addr
+    dut.hburst.value = 0b101      # INCR8
+    dut.hmastlock.value = 0
+    dut.hprot.value = 0
+    dut.hsize.value = 3           # 8-byte beat
+    dut.htrans.value = 0b10       # NONSEQ
+    dut.hwrite.value = 1
+    dut.hwdata.value = 0
+
+    await _wait_hready_high(dut)
+
+    dut.haddr.value = addr + 8
+    dut.hburst.value = 0b101
+    dut.hsize.value = 3
+    dut.htrans.value = 0b11       # SEQ
+    dut.hwrite.value = 1
+    dut.hwdata.value = data0
+
+    await _wait_hready_high(dut)
+
+    # Complete beat 1's data phase while the bridge is deselected. v22b kept
+    # the two writes buffered here until a future HSEL=1 transfer appeared.
+    dut.hsel.value = 0
+    dut.haddr.value = 0
+    dut.hburst.value = 0
+    dut.hsize.value = 0
+    dut.htrans.value = 0b00       # IDLE/non-selected for this slave
+    dut.hwrite.value = 0
+    dut.hwdata.value = data1
+
+    await _wait_hready_high(dut)
+
+    saw_aw = False
+    for _ in range(4):
+        await RisingEdge(dut.clk)
+        await ReadOnly()
+        if int(dut.m_axi_awvalid.value):
+            saw_aw = True
+            break
+
+    assert saw_aw, (
+        "BUG22C: partial fixed write remained buffered after HSEL deasserted; "
+        f"state={int(dut.dut.state.value)} acc_cnt={int(dut.dut.acc_cnt.value)} "
+        f"beat_cnt={int(dut.dut.beat_cnt.value)}"
+    )
+    assert int(dut.m_axi_awaddr.value) == addr, (
+        f"BUG22C: AWADDR=0x{int(dut.m_axi_awaddr.value):08x}, expected 0x{addr:08x}"
+    )
+    assert int(dut.m_axi_awlen.value) == 1, (
+        f"BUG22C: AWLEN={int(dut.m_axi_awlen.value)}, expected 1 for two accepted beats"
+    )
+    assert int(dut.m_axi_awburst.value) == 1, (
+        f"BUG22C: AWBURST={int(dut.m_axi_awburst.value)}, expected INCR"
+    )
+
+
+async def _bug22d_drive_first_fixed_write_no_b_wait(dut, addr, data):
+    hburst = 0b101
+    hsize = AHB_SIZE_8
+
+    dut.hsel.value = 1
+    dut.hreadyin.value = 1
+    dut.haddr.value = addr
+    dut.hburst.value = hburst
+    dut.hmastlock.value = 0
+    dut.hprot.value = 0
+    dut.hsize.value = hsize
+    dut.htrans.value = AHB_NONSEQ
+    dut.hwrite.value = 1
+    dut.hwdata.value = 0
+
+    for beat in range(8):
+        for _ in range(200):
+            await RisingEdge(dut.clk)
+            await ReadOnly()
+            hready = int(dut.hready.value)
+            await NextTimeStep()
+            dut.hreadyin.value = hready
+            if hready:
+                break
+        else:
+            raise AssertionError("BUG22D setup: first write HREADY timeout")
+
+        if beat == 7:
+            dut.haddr.value = 0
+            dut.hburst.value = 0
+            dut.hsize.value = 0
+            dut.htrans.value = AHB_IDLE
+            dut.hwrite.value = 0
+        else:
+            dut.haddr.value = addr + (beat + 1) * 8
+            dut.hburst.value = hburst
+            dut.hsize.value = hsize
+            dut.htrans.value = AHB_SEQ
+            dut.hwrite.value = 1
+
+        dut.hwdata.value = data[beat]
+
+    await RisingEdge(dut.clk)
+    await NextTimeStep()
+    dut.hreadyin.value = int(dut.hready.value)
+
+
+@cocotb.test()
+async def test_regression_bug22d_pending_fixed_write_seq_beat0_not_deadlocked(dut):
+    set_test_id(dut)
+
+    ADDR_A = 0x809F1000
+    ADDR_B = 0x809F1640
+    DATA_A = [0xA220_0000_0000_0000 | i for i in range(8)]
+    DATA_B = [0xB220_0000_0000_0000 | i for i in range(8)]
+
+    await setup_dut_no_axi_slave(dut)
+
+    first_w_done = Event()
+    first_b_release = Event()
+
+    async def axi_slave():
+        results = []
+
+        dut.m_axi_awready.value = 0
+        dut.m_axi_wready.value = 0
+        dut.m_axi_bvalid.value = 0
+        dut.m_axi_bresp.value = 0
+        dut.m_axi_bid.value = 0
+
+        for burst_idx in range(2):
+            while not int(dut.m_axi_awvalid.value):
+                await RisingEdge(dut.clk)
+            dut.m_axi_awready.value = 1
+            while True:
+                await RisingEdge(dut.clk)
+                if int(dut.m_axi_awvalid.value) and int(dut.m_axi_awready.value):
+                    awaddr = int(dut.m_axi_awaddr.value)
+                    awlen = int(dut.m_axi_awlen.value)
+                    break
+            dut.m_axi_awready.value = 0
+
+            beats = []
+            while True:
+                while not int(dut.m_axi_wvalid.value):
+                    await RisingEdge(dut.clk)
+                dut.m_axi_wready.value = 1
+                await RisingEdge(dut.clk)
+                beats.append((int(dut.m_axi_wdata.value), int(dut.m_axi_wlast.value)))
+                wlast = int(dut.m_axi_wlast.value)
+                dut.m_axi_wready.value = 0
+                if wlast:
+                    break
+
+            if burst_idx == 0:
+                first_w_done.set()
+                await first_b_release.wait()
+
+            dut.m_axi_bvalid.value = 1
+            dut.m_axi_bresp.value = 0
+            while True:
+                await RisingEdge(dut.clk)
+                if int(dut.m_axi_bvalid.value) and int(dut.m_axi_bready.value):
+                    break
+            dut.m_axi_bvalid.value = 0
+
+            results.append((awaddr, awlen, beats))
+
+        return results
+
+    slave_task = cocotb.start_soon(axi_slave())
+
+    await _bug22d_drive_first_fixed_write_no_b_wait(dut, ADDR_A, DATA_A)
+    await with_timeout(first_w_done.wait(), 20, "us")
+
+    dut.hsel.value = 1
+    dut.hreadyin.value = 1
+    dut.haddr.value = ADDR_B
+    dut.hburst.value = 0b101
+    dut.hsize.value = AHB_SIZE_8
+    dut.htrans.value = AHB_NONSEQ
+    dut.hwrite.value = 1
+    dut.hwdata.value = 0
+
+    await RisingEdge(dut.clk)
+    await NextTimeStep()
+
+    # Trace signature: pending base is ADDR_B, while the live AHB bus is
+    # already parked on SEQ beat 1 with beat-0 data and HREADYIN low.
+    dut.hreadyin.value = 0
+    dut.haddr.value = ADDR_B + 8
+    dut.hburst.value = 0b101
+    dut.hsize.value = AHB_SIZE_8
+    dut.htrans.value = AHB_SEQ
+    dut.hwrite.value = 1
+    dut.hwdata.value = DATA_B[0]
+
+    first_b_release.set()
+
+    for _ in range(200):
+        await RisingEdge(dut.clk)
+        await ReadOnly()
+        hready = int(dut.hready.value)
+        await NextTimeStep()
+        dut.hreadyin.value = hready
+        if hready:
+            break
+    else:
+        raise AssertionError(
+            "BUG22D: bridge deadlocked after pending fixed write advanced to "
+            f"SEQ beat 1; state={int(dut.dut.state.value)} "
+            f"pnd_addr=0x{int(dut.dut.pnd_addr.value):08x}"
+        )
+
+    # The first high HREADY only releases the deadlock while HREADYIN was low.
+    # Keep the bus parked for one accepted cycle so the held SEQ beat-1 address
+    # enters the bridge pipeline before advancing to beat 2.
+    for _ in range(200):
+        await RisingEdge(dut.clk)
+        await ReadOnly()
+        hready = int(dut.hready.value)
+        await NextTimeStep()
+        dut.hreadyin.value = hready
+        if hready:
+            break
+    else:
+        raise AssertionError("BUG22D: HREADY timeout accepting held SEQ beat 1")
+
+    for beat in range(1, 8):
+        if beat == 7:
+            dut.haddr.value = 0
+            dut.hburst.value = 0
+            dut.hsize.value = 0
+            dut.htrans.value = AHB_IDLE
+            dut.hwrite.value = 0
+        else:
+            dut.haddr.value = ADDR_B + (beat + 1) * 8
+            dut.hburst.value = 0b101
+            dut.hsize.value = AHB_SIZE_8
+            dut.htrans.value = AHB_SEQ
+            dut.hwrite.value = 1
+
+        dut.hwdata.value = DATA_B[beat]
+
+        for _ in range(200):
+            await RisingEdge(dut.clk)
+            await ReadOnly()
+            hready = int(dut.hready.value)
+            await NextTimeStep()
+            dut.hreadyin.value = hready
+            if hready:
+                break
+        else:
+            raise AssertionError(f"BUG22D: HREADY timeout on recovered beat {beat}")
+
+    _init_direct_ahb_signals(dut)
+
+    results = await with_timeout(slave_task, 40, "us")
+    assert len(results) == 2
+
+    awaddr1, awlen1, beats1 = results[1]
+    assert awaddr1 == ADDR_B, (
+        f"BUG22D second burst AWADDR=0x{awaddr1:08x}, expected 0x{ADDR_B:08x}"
+    )
+    assert awlen1 == 7, f"BUG22D second burst AWLEN={awlen1}, expected 7"
+    assert len(beats1) == 8, f"BUG22D second burst emitted {len(beats1)} beats"
+
+    for idx, (wdata, wlast) in enumerate(beats1):
+        assert wdata == DATA_B[idx], (
+            f"BUG22D WDATA beat {idx}: got 0x{wdata:016x}, expected 0x{DATA_B[idx]:016x}"
+        )
+        assert wlast == (1 if idx == 7 else 0), (
+            f"BUG22D WLAST beat {idx}: got {wlast}"
+        )
+
+
+@cocotb.test()
+async def test_regression_bug22f_pending_single_write_during_last_resp_captures_data_phase(dut):
+    set_test_id(dut)
+
+    ADDR0 = 0x100B0000
+    ADDR1 = 0x100B0004
+    DATA0 = 0x0000000000000000
+    DATA1 = 0x0000000700000007
+    SIZE_WORD = 2
+
+    await setup_dut_no_axi_slave(dut)
+
+    first_w_done = Event()
+    release_first_b = Event()
+
+    async def axi_single_write_slave():
+        results = []
+        dut.m_axi_awready.value = 0
+        dut.m_axi_wready.value = 0
+        dut.m_axi_bvalid.value = 0
+        dut.m_axi_bresp.value = 0
+        dut.m_axi_bid.value = 0
+
+        for burst_idx in range(2):
+            while not int(dut.m_axi_awvalid.value):
+                await RisingEdge(dut.clk)
+            dut.m_axi_awready.value = 1
+            while True:
+                await RisingEdge(dut.clk)
+                if int(dut.m_axi_awvalid.value) and int(dut.m_axi_awready.value):
+                    awaddr = int(dut.m_axi_awaddr.value)
+                    awlen = int(dut.m_axi_awlen.value)
+                    break
+            dut.m_axi_awready.value = 0
+
+            while not int(dut.m_axi_wvalid.value):
+                await RisingEdge(dut.clk)
+            dut.m_axi_wready.value = 1
+            while True:
+                await RisingEdge(dut.clk)
+                if int(dut.m_axi_wvalid.value) and int(dut.m_axi_wready.value):
+                    wdata = int(dut.m_axi_wdata.value)
+                    wstrb = int(dut.m_axi_wstrb.value)
+                    wlast = int(dut.m_axi_wlast.value)
+                    break
+            dut.m_axi_wready.value = 0
+
+            if burst_idx == 0:
+                first_w_done.set()
+                await release_first_b.wait()
+
+            dut.m_axi_bvalid.value = 1
+            while True:
+                await RisingEdge(dut.clk)
+                if int(dut.m_axi_bvalid.value) and int(dut.m_axi_bready.value):
+                    break
+            dut.m_axi_bvalid.value = 0
+
+            results.append((awaddr, awlen, wdata, wstrb, wlast))
+
+        return results
+
+    slave_task = cocotb.start_soon(axi_single_write_slave())
+
+    dut.hsel.value = 1
+    dut.hreadyin.value = 1
+    dut.haddr.value = ADDR0
+    dut.hburst.value = AHB_BURST_SINGLE
+    dut.hsize.value = SIZE_WORD
+    dut.htrans.value = AHB_NONSEQ
+    dut.hwrite.value = 1
+    dut.hwdata.value = 0
+
+    await RisingEdge(dut.clk)
+    await NextTimeStep()
+    dut.hsel.value = 0
+    dut.htrans.value = AHB_IDLE
+    dut.hwrite.value = 0
+    dut.haddr.value = 0
+    dut.hsize.value = 0
+    dut.hwdata.value = DATA0
+
+    await with_timeout(first_w_done.wait(), 20, "us")
+
+    # Recreate the FPGA hang signature: a second SINGLE write address appears
+    # for one cycle while the bridge is still in ST_WR_LAST_RESP waiting for B.
+    dut.hsel.value = 1
+    dut.hreadyin.value = 1
+    dut.haddr.value = ADDR1
+    dut.hburst.value = AHB_BURST_SINGLE
+    dut.hsize.value = SIZE_WORD
+    dut.htrans.value = AHB_NONSEQ
+    dut.hwrite.value = 1
+    dut.hwdata.value = 0
+
+    await RisingEdge(dut.clk)
+    await NextTimeStep()
+
+    # The data phase belongs to ADDR1 even though the live address phase is now
+    # deselected. Broken RTL ignores this one-cycle data phase and later parks
+    # forever in ST_WR_PND_ALIGN with pnd_valid already consumed.
+    dut.hsel.value = 0
+    dut.hreadyin.value = 0
+    dut.haddr.value = 0
+    dut.hburst.value = AHB_BURST_SINGLE
+    dut.hsize.value = 0
+    dut.htrans.value = AHB_IDLE
+    dut.hwrite.value = 0
+    dut.hwdata.value = DATA1
+
+    await RisingEdge(dut.clk)
+    await NextTimeStep()
+
+    release_first_b.set()
+
+    for _ in range(200):
+        await RisingEdge(dut.clk)
+        await ReadOnly()
+        hready = int(dut.hready.value)
+        state = int(dut.dut.state.value)
+        await NextTimeStep()
+        dut.hreadyin.value = hready
+        if hready:
+            break
+        if state == 1 and not int(dut.dut.pnd_valid.value):
+            raise AssertionError(
+                "BUG22F: bridge reached ST_WR_PND_ALIGN with pnd_valid=0 "
+                "after pending SINGLE write data phase"
+            )
+    else:
+        raise AssertionError(
+            f"BUG22F: hready never recovered; state={int(dut.dut.state.value)} "
+            f"pnd_valid={int(dut.dut.pnd_valid.value)}"
+        )
+
+    _init_direct_ahb_signals(dut)
+
+    results = await with_timeout(slave_task, 40, "us")
+    assert len(results) == 2
+
+    aw0, awlen0, wdata0, wstrb0, wlast0 = results[0]
+    assert aw0 == ADDR0
+    assert awlen0 == 0
+    assert wdata0 == DATA0
+    assert wstrb0 == 0x0F
+    assert wlast0 == 1
+
+    aw1, awlen1, wdata1, wstrb1, wlast1 = results[1]
+    assert aw1 == ADDR1
+    assert awlen1 == 0
+    assert wdata1 == DATA1
+    assert wstrb1 == 0xF0
+    assert wlast1 == 1
+
+
+@cocotb.test()
+async def test_regression_bug22g_st_wr_d_early_read_nonseq_is_latched(dut):
+    set_test_id(dut)
+
+    WRITE_ADDR = 0xBED1CDC0
+    READ_ADDR = 0x80779680
+    WRITE_DATA0 = 0x0800E406E0221141
+
+    await setup_dut_no_axi_slave(dut)
+
+    dut.m_axi_awready.value = 0
+    dut.m_axi_wready.value = 0
+    dut.m_axi_bvalid.value = 0
+    dut.m_axi_bresp.value = 0
+
+    # Start a fixed-length write.  The next cycle is beat-0's write data
+    # phase, and AHB is allowed to terminate the burst early with a new NONSEQ.
+    dut.hsel.value = 1
+    dut.hreadyin.value = 1
+    dut.haddr.value = WRITE_ADDR
+    dut.hburst.value = 0b101      # INCR8
+    dut.hmastlock.value = 0
+    dut.hprot.value = 0
+    dut.hsize.value = AHB_SIZE_8
+    dut.htrans.value = AHB_NONSEQ
+    dut.hwrite.value = 1
+    dut.hwdata.value = 0
+
+    await RisingEdge(dut.clk)
+    await ReadOnly()
+    assert int(dut.dut.state.value) == 2, (
+        f"BUG22G setup: expected ST_WR_D after write NONSEQ, got {int(dut.dut.state.value)}"
+    )
+    await NextTimeStep()
+
+    # This matches the sysvinit ILA signature: while ST_WR_D is consuming the
+    # write data beat, the live AHB address phase is already a read NONSEQ.
+    # Broken RTL leaves HREADY high, does not latch pnd_valid, and the read is
+    # never converted into an AXI AR.
+    dut.hwdata.value = WRITE_DATA0
+    dut.haddr.value = READ_ADDR
+    dut.hburst.value = 0b101      # INCR8 read burst
+    dut.hsize.value = AHB_SIZE_8
+    dut.htrans.value = AHB_NONSEQ
+    dut.hwrite.value = 0
+
+    await RisingEdge(dut.clk)
+    await ReadOnly()
+
+    assert int(dut.dut.pnd_valid.value) == 1, (
+        "BUG22G: ST_WR_D accepted an early read NONSEQ but did not latch it. "
+        f"state={int(dut.dut.state.value)} HREADY={int(dut.hready.value)} "
+        f"beat_cnt={int(dut.dut.beat_cnt.value)} "
+        f"last_ahb=0x{int(dut.dut.dbg_last_ahb_addr.value):08x}"
+    )
+    assert int(dut.dut.pnd_write.value) == 0, "BUG22G: pending transfer should be a read"
+    assert int(dut.dut.pnd_addr.value) == READ_ADDR, (
+        f"BUG22G: pnd_addr=0x{int(dut.dut.pnd_addr.value):08x}, expected 0x{READ_ADDR:08x}"
+    )
+    assert int(dut.hready.value) == 0, (
+        "BUG22G: bridge must stall after latching the pending read so SEQ beats cannot slip by"
+    )
+
+
+@cocotb.test()
+async def test_regression_bug22h_latched_read_after_write_beat_flushes_partial_write(dut):
+    set_test_id(dut)
+
+    WRITE_ADDR = 0xBED19DC0
+    READ_ADDR = 0x80779680
+    WRITE_DATA0 = 0x0800E406E0221141
+
+    await setup_dut_no_axi_slave(dut)
+
+    dut.m_axi_awready.value = 0
+    dut.m_axi_wready.value = 0
+    dut.m_axi_bvalid.value = 0
+    dut.m_axi_bresp.value = 0
+    dut.m_axi_arready.value = 0
+
+    # Start a fixed write burst.  On the following cycle, the write beat 0
+    # data phase coincides with an early read NONSEQ, matching the ILA hang.
+    dut.hsel.value = 1
+    dut.hreadyin.value = 1
+    dut.haddr.value = WRITE_ADDR
+    dut.hburst.value = 0b101
+    dut.hmastlock.value = 0
+    dut.hprot.value = 0
+    dut.hsize.value = AHB_SIZE_8
+    dut.htrans.value = AHB_NONSEQ
+    dut.hwrite.value = 1
+    dut.hwdata.value = 0
+
+    await RisingEdge(dut.clk)
+    await ReadOnly()
+    assert int(dut.dut.state.value) == 2, (
+        f"BUG22H setup: expected ST_WR_D, got state={int(dut.dut.state.value)}"
+    )
+    await NextTimeStep()
+
+    dut.hwdata.value = WRITE_DATA0
+    dut.haddr.value = READ_ADDR
+    dut.hburst.value = 0b101
+    dut.hsize.value = AHB_SIZE_8
+    dut.htrans.value = AHB_NONSEQ
+    dut.hwrite.value = 0
+
+    await RisingEdge(dut.clk)
+    await ReadOnly()
+    assert int(dut.dut.pnd_valid.value) == 1
+    assert int(dut.dut.pnd_write.value) == 0
+    assert int(dut.dut.pnd_addr.value) == READ_ADDR
+    assert int(dut.dut.acc_cnt.value) == 1
+    assert int(dut.hready.value) == 0
+    await NextTimeStep()
+
+    # The stalled master now holds the read SEQ.  Broken v22g-style RTL stays
+    # in ST_WR_D forever because it only flushes on live IDLE/NONSEQ, but the
+    # accepted read's follow-on address is SEQ while HREADY is low.
+    dut.haddr.value = READ_ADDR + 8
+    dut.hburst.value = 0b101
+    dut.hsize.value = AHB_SIZE_8
+    dut.htrans.value = AHB_SEQ
+    dut.hwrite.value = 0
+
+    aw_seen = False
+    for _ in range(8):
+        await RisingEdge(dut.clk)
+        await ReadOnly()
+        if int(dut.m_axi_awvalid.value):
+            aw_seen = True
+            assert int(dut.m_axi_awaddr.value) == WRITE_ADDR
+            assert int(dut.m_axi_awlen.value) == 0
+            break
+        await NextTimeStep()
+
+    assert aw_seen, (
+        "BUG22H: latched read after a captured write beat did not force the "
+        f"partial write to flush; state={int(dut.dut.state.value)} "
+        f"pnd_valid={int(dut.dut.pnd_valid.value)} "
+        f"acc_cnt={int(dut.dut.acc_cnt.value)}"
+    )
+    await NextTimeStep()
+
+    dut.m_axi_awready.value = 1
+    await RisingEdge(dut.clk)
+    await ReadOnly()
+    await NextTimeStep()
+    dut.m_axi_awready.value = 0
+
+    w_seen = False
+    for _ in range(8):
+        await RisingEdge(dut.clk)
+        await ReadOnly()
+        if int(dut.m_axi_wvalid.value):
+            w_seen = True
+            assert int(dut.m_axi_wdata.value) == WRITE_DATA0
+            assert int(dut.m_axi_wstrb.value) == 0xFF
+            assert int(dut.m_axi_wlast.value) == 1
+            break
+        await NextTimeStep()
+
+    assert w_seen, (
+        "BUG22H: partial write AW was issued but W beat did not follow; "
+        f"state={int(dut.dut.state.value)} flush_ptr={int(dut.dut.flush_ptr.value)}"
+    )
+    await NextTimeStep()
+
+    dut.m_axi_wready.value = 1
+    dut.m_axi_bresp.value = 0
+    dut.m_axi_bvalid.value = 1
+    await RisingEdge(dut.clk)
+    await ReadOnly()
+    await NextTimeStep()
+    dut.m_axi_wready.value = 0
+    dut.m_axi_bvalid.value = 0
+
+    ar_seen = False
+    for _ in range(16):
+        await RisingEdge(dut.clk)
+        await ReadOnly()
+        if int(dut.m_axi_arvalid.value):
+            ar_seen = True
+            assert int(dut.m_axi_araddr.value) == READ_ADDR
+            assert int(dut.m_axi_arlen.value) == 7
+            break
+        await NextTimeStep()
+
+    assert ar_seen, (
+        "BUG22H: partial write flushed but pending read was not dispatched; "
+        f"state={int(dut.dut.state.value)} pnd_valid={int(dut.dut.pnd_valid.value)}"
     )

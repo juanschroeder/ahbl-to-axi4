@@ -1,0 +1,16 @@
+[options]
+mode bmc
+depth 100
+
+[engines]
+# abc proved this quickly; dropping boolector avoids wasted RAM on parallel runs.
+abc bmc3
+
+[script]
+read_verilog -formal -sv ahb_to_axi4_burst_formal_tap.sv
+read_verilog -formal -sv ahb_to_axi4_burst_wr_buffer_capture_fv.sv
+prep -top ahb_to_axi4_burst_wr_buffer_capture_fv
+
+[files]
+rtl/ahb_to_axi4_burst_formal_tap.sv
+formal/ahb_to_axi4_burst_wr_buffer_capture_fv.sv

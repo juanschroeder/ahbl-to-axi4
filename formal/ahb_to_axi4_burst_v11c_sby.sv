@@ -140,8 +140,6 @@ module ahb_to_axi4_burst #(
   // ?????? INCR write buffer sizing ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
   localparam int unsigned IBUF_IDX_W = $clog2(MAX_INCR_BEATS);
   localparam int unsigned IBUF_CNT_W = IBUF_IDX_W + 1;
-  localparam logic [12:0]       MAX_INCR_BEATS_13 = MAX_INCR_BEATS;
-  localparam logic [IBUF_CNT_W-1:0] MAX_INCR_BEATS_M1 = MAX_INCR_BEATS - 1;
 
   // ?????? State machine ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
   typedef enum logic [4:0] {
@@ -199,9 +197,6 @@ module ahb_to_axi4_burst #(
   logic [DW/8-1:0]       ibuf_strb [0:MAX_INCR_BEATS-1];
   (* mark_debug = "true" *) logic [IBUF_CNT_W-1:0] acc_cnt;
   (* mark_debug = "true" *) logic [IBUF_IDX_W-1:0] flush_ptr;
-  logic [AW-1:0]               acc_cnt_aw;
-  logic [7:0]                  acc_cnt_u8;
-  logic                        fix_flush_full_len;
 
   // ?????? INCR-specific tracking registers ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
   (* mark_debug = "true" *) logic incr_rd;          // Active INCR read burst (chunked)
@@ -226,7 +221,6 @@ module ahb_to_axi4_burst #(
   logic [DW/8-1:0]   pnd_wfirst_strb;
   logic              pnd_wpipe_mode;
   logic              pnd_align_pulse_q;
-  logic              pnd_wfirst_sysphase_q;
 
   // wstrb derivation
   logic [DW/8-1:0] ahb_wstrb_d;
@@ -254,21 +248,11 @@ module ahb_to_axi4_burst #(
   (* mark_debug = "true" *) logic [2:0]       hsize_q;
   (* mark_debug = "true" *) logic [1:0]       htrans_q;
   (* mark_debug = "true" *) logic             hwrite_q;
-  (* mark_debug = "true" *) logic             rd_q_holds_current_start;
 
   // Functional helpers for read-side handoff decisions.
   // These are intentionally separate from dbg_* so the fix does not depend on
   // debug instrumentation being kept.
-  logic             rd_live_nonseq_raw;
-  logic             rd_live_interleave_raw;
   logic             rd_live_nonseq;
-  logic             rd_live_sameaddr_followon_raw;
-  logic             rd_sameaddr_followon_cand;
-  logic [AW-1:0]    rd_sameaddr_followon_addr;
-  logic [2:0]       rd_sameaddr_followon_size;
-  logic [2:0]       rd_sameaddr_followon_burst;
-  logic [3:0]       rd_sameaddr_followon_prot;
-  logic             rd_sameaddr_followon_lock;
   logic             rd_q_nonseq;
   logic             rd_live_interleave;
   logic             rd_q_interleave;
@@ -319,51 +303,46 @@ module ahb_to_axi4_burst #(
   // ?????? INCR chunk-length calculation (respects 4 KB AXI boundary) ??????????????????????????????????????????
   // Returns the AxLEN value (number of beats minus one).
   // Caps at MAX_INCR_BEATS-1 and ensures the burst does not cross a 4 KB page.
-  function automatic [7:0] calc_incr_len (
-    input [AW-1:0] addr,
-    input [2:0]    size
+  function automatic logic [7:0] calc_incr_len (
+    input logic [AW-1:0] addr,
+    input logic [2:0]    size
   );
-    reg [12:0] bytes_to_boundary;
-    reg [12:0] beats_to_boundary;
-    begin
-      bytes_to_boundary = 13'h1000 - {1'b0, addr[11:0]};
-      beats_to_boundary = bytes_to_boundary >> size;
-      if (beats_to_boundary >= MAX_INCR_BEATS_13)
-        calc_incr_len = MAX_INCR_BEATS - 1;
-      else if (beats_to_boundary <= 13'd1)
-        calc_incr_len = 8'd0;
-      else
-        calc_incr_len = beats_to_boundary - 13'd1;
-    end
+    logic [12:0] bytes_to_boundary;
+    logic [12:0] beats_to_boundary;
+    bytes_to_boundary = 13'h1000 - {1'b0, addr[11:0]};
+    beats_to_boundary = bytes_to_boundary >> size;
+    if (beats_to_boundary >= 13'd16)
+      calc_incr_len = 8'd15;
+    else if (beats_to_boundary <= 13'd1)
+      calc_incr_len = 8'd0;
+    else
+      calc_incr_len = beats_to_boundary[7:0] - 8'd1;
   endfunction
 
   // ?????? HPROT ??? AXPROT ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
-  function automatic [2:0] hprot_to_axprot (input [3:0] hp);
-    begin
-      // AHB HPROT[0] = data(1)/opcode(0)
-      // AHB HPROT[1] = privileged(1)/user(0)
-      // AXI AXPROT[2] = instruction(1)/data(0)
-      // AXI AXPROT[1] = non-secure
-      // AXI AXPROT[0] = privileged
-      hprot_to_axprot = {~hp[0], 1'b0, hp[1]};
-    end
+  function automatic logic [2:0] hprot_to_axprot (input logic [3:0] hp);
+    // AHB HPROT[0] = data(1)/opcode(0)
+    // AHB HPROT[1] = privileged(1)/user(0)
+    // AXI AXPROT[2] = instruction(1)/data(0)
+    // AXI AXPROT[1] = non-secure
+    // AXI AXPROT[0] = privileged
+    hprot_to_axprot = {~hp[0], 1'b0, hp[1]};
   endfunction
 
 
-  function automatic [DW/8-1:0] ahb_addrsize_to_wstrb (
-    input [AW-1:0] addr,
-    input [2:0]    size
+  function automatic logic [DW/8-1:0] ahb_addrsize_to_wstrb (
+    input logic [AW-1:0] addr,
+    input logic [2:0]    size
   );
-    reg [DW/8-1:0] mask;
+    logic [DW/8-1:0] mask;
     integer nbytes;
     integer lane0;
-    integer b;
     begin
-      mask   = {DW/8{1'b0}};
+      mask   = '0;
       nbytes = 1 << size;
       lane0  = addr[$clog2(DW/8)-1:0];
 
-      for (b = 0; b < DW/8; b = b + 1) begin
+      for (integer b = 0; b < DW/8; b = b + 1) begin
         if ((b >= lane0) && (b < lane0 + nbytes))
           mask[b] = 1'b1;
       end
@@ -375,10 +354,6 @@ module ahb_to_axi4_burst #(
   // ?????? Helper: capture new transaction from address phase ??????????????????????????????????????????????????????????????????
   // (Used by multiple states for lookahead / back-to-back capture.)
   // Returns next state, updates registers via procedural assignments.
-
-  assign acc_cnt_aw = {{(AW-IBUF_CNT_W){1'b0}}, acc_cnt};
-  assign acc_cnt_u8 = {{(8-IBUF_CNT_W){1'b0}}, acc_cnt};
-  assign fix_flush_full_len = (acc_cnt_u8 == (ap_axlen + 8'd1));
 
   // ?????? Sequential state machine ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
   always_ff @(posedge clk) begin
@@ -405,7 +380,6 @@ module ahb_to_axi4_burst #(
       pnd_wfirst_strb  <= '0;
       pnd_wpipe_mode   <= 1'b0;
       pnd_align_pulse_q <= 1'b0;
-      pnd_wfirst_sysphase_q <= 1'b0;
       // loop fix
       hsel_q      <= 1'b0;
       hreadyin_q  <= 1'b0;
@@ -416,13 +390,6 @@ module ahb_to_axi4_burst #(
       hsize_q     <= 3'd0;
       htrans_q    <= TRN_IDLE;
       hwrite_q    <= 1'b0;
-      rd_q_holds_current_start <= 1'b0;
-      rd_sameaddr_followon_cand <= 1'b0;
-      rd_sameaddr_followon_addr <= '0;
-      rd_sameaddr_followon_size <= 3'd0;
-      rd_sameaddr_followon_burst <= 3'd0;
-      rd_sameaddr_followon_prot <= 4'd0;
-      rd_sameaddr_followon_lock <= 1'b0;
       rd_buf_data   <= '0;
       rd_buf_resp   <= 2'b00;
       rd_buf_valid  <= 1'b0;
@@ -431,9 +398,6 @@ module ahb_to_axi4_burst #(
       rd_d_entry <= 1'b0;
     end else begin
 // loop fix: only advance when master considers address phase accepted
-      if (pnd_wfirst_sysphase_q)
-        pnd_wfirst_sysphase_q <= 1'b0;
-
       hreadyin_q  <= HREADYIN;
       if (HREADY && HREADYIN) begin
         hsel_q      <= HSEL;
@@ -444,17 +408,11 @@ module ahb_to_axi4_burst #(
         hsize_q     <= HSIZE;
         htrans_q    <= HTRANS;
         hwrite_q    <= HWRITE;
-        if ((state == ST_RD_D) || (state == ST_RD_DRAIN) || (state == ST_RD_FENCE))
-          rd_q_holds_current_start <= 1'b0;
       end      
       // Capture one AXI R beat into the local holding register ONLY when it
       // belongs to the currently active read transaction in ST_RD_D.
       // Any AXI R beats accepted in other states are intentionally scrubbed.
-      if (!rd_buf_valid && raw_r_capture &&
-          !((state == ST_RD_D) &&
-            !incr_rd &&
-            (beat_cnt != 8'd0) &&
-            (pnd_valid || rd_q_interleave || rd_live_interleave_raw))) begin
+      if (!rd_buf_valid && raw_r_capture) begin
         rd_buf_data  <= RDATA;
         rd_buf_resp  <= RRESP;
         rd_buf_valid <= 1'b1;
@@ -473,8 +431,6 @@ module ahb_to_axi4_burst #(
           incr_drain   <= 1'b0;
           incr_rd_busy <= 1'b0;
           pnd_valid    <= 1'b0;  // consume any pending latch
-          rd_q_holds_current_start <= 1'b0;
-          rd_sameaddr_followon_cand <= 1'b0;
 
           // Priority: latched pending transaction > live AHB bus
           if (pnd_valid || (HSEL && HREADYIN && (HTRANS == TRN_NONSEQ))) begin
@@ -509,25 +465,10 @@ module ahb_to_axi4_burst #(
                     pnd_align_pulse_q <= 1'b0;
                     wstrb_first      <= pnd_wfirst_strb;
                     state            <= ST_WR_D;
-                  end else if (pnd_wfirst_capture_ok) begin
-                    // A pending fixed write can reach ST_IDLE with beat 0
-                    // already proven on the delayed AHB write-phase tracker.
-                    // Capture it here instead of entering ST_WR_PND_ALIGN and
-                    // waiting for a live bus phase that may no longer be
-                    // visible to this slave.
-                    pnd_wfirst_valid <= 1'b1;
-                    pnd_wfirst_data  <= HWDATA;
-                    pnd_wfirst_strb  <= pnd_wfirst_capture_strb;
-                    pnd_wpipe_mode   <= 1'b0;
-                    pnd_align_pulse_q <= 1'b0;
-                    wstrb_first      <= pnd_wfirst_capture_strb;
-                    state            <= ST_WR_D;
                   end else begin
                     pnd_wfirst_valid <= 1'b0;
                     pnd_wpipe_mode   <= 1'b0;
-                    pnd_align_pulse_q <= HSEL && HREADYIN &&
-                                         (HADDR == pnd_addr) &&
-                                         (HSIZE == pnd_size) &&
+                    pnd_align_pulse_q <= (HADDR == pnd_addr) &&
                                          (HTRANS == TRN_NONSEQ) &&
                                          HWRITE;
                     wstrb_first      <= ahb_addrsize_to_wstrb(pnd_addr, pnd_size);
@@ -544,7 +485,6 @@ module ahb_to_axi4_burst #(
                   incr_rd  <= 1'b0;
                   beat_cnt <= pnd_c_axlen;
                 end
-                rd_q_holds_current_start <= 1'b1;
                 ar_done <= 1'b0;
                 state   <= ST_RD_A;
               end
@@ -578,7 +518,6 @@ module ahb_to_axi4_burst #(
                   incr_rd  <= 1'b0;
                   beat_cnt <= c_axlen;
                 end
-                rd_q_holds_current_start <= 1'b1;
                 ar_done <= 1'b0;
                 state   <= ST_RD_A;
               end
@@ -599,40 +538,23 @@ module ahb_to_axi4_burst #(
             pnd_align_pulse_q <= 1'b0;
             pnd_wpipe_mode <= 1'b1;
             state          <= ST_WR_PND_ALIGN;
-          end else if (pnd_wfirst_capture_ok) begin
+          end else begin
             pnd_wfirst_valid <= 1'b1;
             pnd_wfirst_data  <= HWDATA;
-            pnd_wfirst_strb  <= pnd_wfirst_capture_strb;
+            pnd_wfirst_strb  <= ahb_addrsize_to_wstrb(pnd_addr, pnd_size);
             pnd_wpipe_mode   <= 1'b0;
             state            <= ST_WR_D;
-          end else if (HSEL && HREADYIN &&
-                       (HADDR == pnd_addr) &&
-                       (HSIZE == pnd_size) &&
-                       (HTRANS == TRN_NONSEQ) &&
-                       HWRITE) begin
-            // If the master is still holding the pending write NONSEQ while we
-            // are stalled here, re-issue the one-cycle HREADY pulse and wait
-            // for the proven beat-0 data phase on the next cycle.
-            pnd_align_pulse_q <= 1'b1;
-            pnd_wpipe_mode    <= 1'b0;
-            state             <= ST_WR_PND_ALIGN;
-          end else begin
-            // Do not sample HWDATA until either the held write address phase
-            // is visible or the delayed write-phase tracker proves beat 0.
-            state <= ST_WR_PND_ALIGN;
           end
         end
 
         // ?????? ST_WR_D ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
-        // Fixed-length write. Accept real AHB write data phases into the
-        // local buffer, then emit one AXI write sized to the beats that were
-        // actually observed. Full-system traces show fixed INCR8 can idle and
-        // restart early; issuing AWLEN from HBURST before the beats are proven
-        // shifts later writes into the old burst.
-        // SINGLE writes are safe to issue immediately because their length
-        // cannot shrink.  Keeping that path immediate preserves the old MMIO
-        // ordering/timing used during bootrom and early boot.
+        // Fixed-length write. Accept all AHB beats into the local buffer at
+        // full AHB speed, then drain them later on the AXI W channel.
         ST_WR_D: begin
+          if (!aw_sent && AWREADY) begin
+            aw_sent <= 1'b1;
+          end
+
           if (fix_ahb_fire) begin
             ibuf_data[acc_cnt[IBUF_IDX_W-1:0]] <= pnd_wfirst_valid ? pnd_wfirst_data : HWDATA;
             ibuf_strb[acc_cnt[IBUF_IDX_W-1:0]] <= pnd_wfirst_valid ? pnd_wfirst_strb : ahb_wstrb_d;
@@ -653,11 +575,9 @@ module ahb_to_axi4_burst #(
               end
             end
 
-            // AHB can legally terminate a fixed burst early with a new
-            // NONSEQ.  If that happens while we are still accumulating the
-            // previous write, latch the new transfer immediately and stall
-            // follow-on SEQ beats until the buffered write has drained.
-            if (!pnd_valid &&
+            // Capture the next transaction only on an actual accepted near-final beat.
+            if ((beat_cnt <= 8'd1) &&
+                !pnd_valid &&
                 HSEL && HREADYIN &&
                 (HTRANS == TRN_NONSEQ)) begin
               pnd_valid      <= 1'b1;
@@ -669,44 +589,14 @@ module ahb_to_axi4_burst #(
               pnd_lock       <= HMASTLOCK;
               pnd_wfirst_valid <= 1'b0;
               pnd_wpipe_mode <= 1'b0;
-              pnd_wfirst_sysphase_q <= HWRITE && (HBURST != HB_INCR) && !HREADY;
             end
 
             if (beat_cnt != 8'd0) begin
               beat_cnt <= beat_cnt - 8'd1;
             end else begin
               flush_ptr <= '0;
-              aw_sent   <= (ap_axlen == 8'd0) ? AWREADY : 1'b0;
               state     <= ST_WR_FIX_FLUSH;
             end
-          end else if ((acc_cnt != '0) &&
-                       (pnd_valid ||
-                        (HREADYIN &&
-                         ((!HSEL) ||
-                          (HSEL && ((HTRANS == TRN_IDLE) || (HTRANS == TRN_NONSEQ))))))) begin
-            // The fixed burst stopped before its declared length.  HSEL=0 is
-            // also a termination point for this slave; do not keep accepted
-            // write data buffered until the next selected access happens.
-            // If a follow-on transfer was already latched, the live bus may
-            // now be stalled on its SEQ beat; flush anyway so forward progress
-            // does not depend on seeing the original NONSEQ again.
-            // Flush the partial write with AWLEN=acc_cnt-1. If a new NONSEQ is
-            // already present, latch it so it starts after the partial AXI write.
-            if (HSEL && (HTRANS == TRN_NONSEQ) && !pnd_valid) begin
-              pnd_valid      <= 1'b1;
-              pnd_addr       <= HADDR;
-              pnd_size       <= HSIZE;
-              pnd_burst      <= HBURST;
-              pnd_write      <= HWRITE;
-              pnd_prot       <= HPROT;
-              pnd_lock       <= HMASTLOCK;
-              pnd_wfirst_valid <= 1'b0;
-              pnd_wpipe_mode <= 1'b0;
-              pnd_wfirst_sysphase_q <= HWRITE && (HBURST != HB_INCR) && !HREADY;
-            end
-            flush_ptr <= '0;
-            aw_sent   <= 1'b0;
-            state     <= ST_WR_FIX_FLUSH;
           end
         end
 
@@ -729,22 +619,20 @@ module ahb_to_axi4_burst #(
             pnd_lock       <= HMASTLOCK;
             pnd_wfirst_valid <= 1'b0;
             pnd_wpipe_mode <= 1'b0;
-            pnd_wfirst_sysphase_q <= HWRITE && (HBURST != HB_INCR) && !HREADY;
           end
 
-          // v12b:
-          // Capture beat 0 for a pending fixed write only when the delayed
-          // AHB write-phase view proves that the pending write's data phase is
-          // currently on HWDATA. HREADYIN alone is too weak here, but removing
-          // this capture entirely breaks the valid latched-pending-SINGLE path.
+          // v7: For a pending fixed write, latch beat 0 only when HREADYIN=1
+          // (the upstream bus is presenting valid data for the accepted NONSEQ).
+          // With HREADYIN=0, HWDATA may be driven by a stalled master or a
+          // bus mux override — only sample when the data phase is guaranteed stable.
           if (pnd_valid &&
               pnd_write &&
               (pnd_burst != HB_INCR) &&
               !pnd_wfirst_valid &&
-              pnd_wfirst_capture_ok) begin
+              HREADYIN) begin
             pnd_wfirst_valid <= 1'b1;
             pnd_wfirst_data  <= HWDATA;
-            pnd_wfirst_strb  <= pnd_wfirst_capture_strb;
+            pnd_wfirst_strb  <= ahb_addrsize_to_wstrb(pnd_addr, pnd_size);
             pnd_wpipe_mode   <= 1'b0;
           end
 
@@ -784,7 +672,7 @@ module ahb_to_axi4_burst #(
             // Save the next strobe now while HREADY=1 so POST_BUSY can use it.
             busy_wstrb <= ahb_addrsize_to_wstrb(HADDR, HSIZE);
             // Buffer-full check after this capture
-            if (acc_cnt == MAX_INCR_BEATS_M1) begin
+            if (acc_cnt == (MAX_INCR_BEATS - 1)) begin
               flush_ptr    <= '0;
               aw_sent      <= 1'b0;
               incr_wr_cont <= 1'b1;
@@ -797,7 +685,7 @@ module ahb_to_axi4_burst #(
             ibuf_strb[acc_cnt[IBUF_IDX_W-1:0]] <= ahb_wstrb_d;
             acc_cnt <= acc_cnt + 1'b1;
             // Buffer-full check
-            if (acc_cnt == MAX_INCR_BEATS_M1) begin
+            if (acc_cnt == (MAX_INCR_BEATS - 1)) begin
               flush_ptr    <= '0;
               aw_sent      <= 1'b0;
               incr_wr_cont <= 1'b1;
@@ -824,7 +712,6 @@ module ahb_to_axi4_burst #(
               pnd_prot  <= HPROT;
               pnd_lock  <= HMASTLOCK;
               pnd_wfirst_valid <= 1'b0;
-              pnd_wfirst_sysphase_q <= HWRITE && (HBURST != HB_INCR) && !HREADY;
             end else begin
               pnd_valid <= 1'b0;
             end
@@ -844,7 +731,7 @@ module ahb_to_axi4_burst #(
             // Refresh busy_wstrb for a potential further BUSY beat.
             // HADDR is stable during BUSY (master holds it per AHB spec).
             busy_wstrb <= ahb_addrsize_to_wstrb(HADDR, HSIZE);
-            if (acc_cnt == MAX_INCR_BEATS_M1) begin
+            if (acc_cnt == (MAX_INCR_BEATS - 1)) begin
               flush_ptr    <= '0;
               aw_sent      <= 1'b0;
               incr_wr_cont <= 1'b1;
@@ -885,7 +772,6 @@ module ahb_to_axi4_burst #(
               pnd_prot  <= HPROT;
               pnd_lock  <= HMASTLOCK;
               pnd_wfirst_valid <= 1'b0;
-              pnd_wfirst_sysphase_q <= HWRITE && (HBURST != HB_INCR) && !HREADY;
             end else begin
               pnd_valid <= 1'b0;
             end
@@ -937,21 +823,18 @@ module ahb_to_axi4_burst #(
             pnd_prot  <= HPROT;
             pnd_lock  <= HMASTLOCK;
             pnd_wfirst_valid <= 1'b0;
-            pnd_wfirst_sysphase_q <= HWRITE && (HBURST != HB_INCR) && !HREADY;
           end
 
-          // v12b:
-          // Capture beat 0 for a pending fixed write only when the delayed
-          // AHB write-phase view proves that the pending write's data phase is
-          // currently on HWDATA. Do not use HREADYIN alone here.
+          // v7: latch beat 0 for a pending fixed write while waiting for B,
+          // but only when HREADYIN=1 (data phase guaranteed stable).
           if (pnd_valid &&
               pnd_write &&
               (pnd_burst != HB_INCR) &&
               !pnd_wfirst_valid &&
-              pnd_wfirst_capture_ok) begin
+              HREADYIN) begin
             pnd_wfirst_valid <= 1'b1;
             pnd_wfirst_data  <= HWDATA;
-            pnd_wfirst_strb  <= pnd_wfirst_capture_strb;
+            pnd_wfirst_strb  <= ahb_addrsize_to_wstrb(pnd_addr, pnd_size);
             pnd_wpipe_mode   <= 1'b0;
           end
 
@@ -960,7 +843,7 @@ module ahb_to_axi4_burst #(
               incr_wr_cont <= 1'b0;
               state <= ST_WR_ERR;
             end else if (incr_wr_cont) begin
-              ap_addr      <= ap_addr + (acc_cnt_aw << ap_size);
+              ap_addr      <= ap_addr + (acc_cnt << ap_size);
               acc_cnt      <= '0;
               flush_ptr    <= '0;
               incr_wr_cont <= 1'b0;
@@ -987,21 +870,18 @@ module ahb_to_axi4_burst #(
             pnd_lock       <= HMASTLOCK;
             pnd_wfirst_valid <= 1'b0;
             pnd_wpipe_mode <= 1'b0;
-            pnd_wfirst_sysphase_q <= HWRITE && (HBURST != HB_INCR) && !HREADY;
           end
 
-          // v12b:
-          // Capture beat 0 for a pending fixed write only when the delayed
-          // AHB write-phase view proves that the pending write's data phase is
-          // currently on HWDATA. Do not use HREADYIN alone here.
+          // v7: latch beat 0 for a pending fixed write while waiting for the
+          // write response of the previous burst, but only when HREADYIN=1.
           if (pnd_valid &&
               pnd_write &&
               (pnd_burst != HB_INCR) &&
               !pnd_wfirst_valid &&
-              pnd_wfirst_capture_ok) begin
+              HREADYIN) begin
             pnd_wfirst_valid <= 1'b1;
             pnd_wfirst_data  <= HWDATA;
-            pnd_wfirst_strb  <= pnd_wfirst_capture_strb;
+            pnd_wfirst_strb  <= ahb_addrsize_to_wstrb(pnd_addr, pnd_size);
             pnd_wpipe_mode   <= 1'b0;
           end
 
@@ -1054,11 +934,12 @@ module ahb_to_axi4_burst #(
           // the write data phase can occur while we are still in ST_RD_D
           // delivering the final read beat / scrubbing the final AXI R beat.
           if (pnd_valid && pnd_write && (pnd_burst != HB_INCR) &&
-              !pnd_wfirst_valid && pnd_wfirst_capture_ok &&
+              !pnd_wfirst_valid && ahb_wphase_valid &&
+              (ahb_waddr_d == pnd_addr) && (ahb_wsize_d == pnd_size) &&
               !pnd_same_live_write_addrphase) begin
             pnd_wfirst_valid <= 1'b1;
             pnd_wfirst_data  <= HWDATA;
-            pnd_wfirst_strb  <= pnd_wfirst_capture_strb;
+            pnd_wfirst_strb  <= ahb_wstrb_d;
           end
 
           if (incr_rd && incr_rd_busy) begin
@@ -1079,73 +960,10 @@ module ahb_to_axi4_burst #(
             end
 
           end else begin
-            if (!rd_buf_valid && raw_r_capture &&
-                !incr_rd && (beat_cnt != 8'd0) &&
-                (pnd_valid || rd_q_interleave || rd_live_interleave_raw)) begin
-              // The just-accepted AXI R beat belongs to the stale tail of the
-              // current fixed read while a follow-on transfer is already
-              // pending/visible. Drop it immediately instead of buffering it
-              // for AHB delivery, then drain only the remaining AXI tail.
-              if (!pnd_valid) begin
-                if (rd_q_nonseq) begin
-                  pnd_valid <= 1'b1;
-                  pnd_addr  <= haddr_q;
-                  pnd_size  <= hsize_q;
-                  pnd_burst <= hburst_q;
-                  pnd_write <= hwrite_q;
-                  pnd_prot  <= hprot_q;
-                  pnd_lock  <= hmastlock_q;
-                  pnd_wfirst_valid <= 1'b0;
-                end else if (HSEL && HREADYIN &&
-                             (HTRANS == TRN_NONSEQ) &&
-                             rd_live_interleave_raw) begin
-                  if (rd_live_sameaddr_followon_raw) begin
-                    // Latest full-system trace: HREADYIN can be high for this
-                    // same-address follow-on NONSEQ even while this bridge's
-                    // HREADYOUT is low, then the live bus advances to SEQ with
-                    // HREADYIN low.  Waiting for a later confirmation loses
-                    // beat0, so HREADYIN=1 is the acceptance evidence here.
-                    pnd_valid <= 1'b1;
-                    pnd_addr  <= HADDR;
-                    pnd_size  <= HSIZE;
-                    pnd_burst <= HBURST;
-                    pnd_write <= 1'b0;
-                    pnd_prot  <= HPROT;
-                    pnd_lock  <= HMASTLOCK;
-                    pnd_wfirst_valid <= 1'b0;
-                    pnd_wfirst_sysphase_q <= 1'b0;
-                    rd_sameaddr_followon_cand <= 1'b0;
-                  end else begin
-                    pnd_valid <= 1'b1;
-                    pnd_addr  <= HADDR;
-                    pnd_size  <= HSIZE;
-                    pnd_burst <= HBURST;
-                    pnd_write <= HWRITE;
-                    pnd_prot  <= HPROT;
-                    pnd_lock  <= HMASTLOCK;
-                    pnd_wfirst_valid <= 1'b0;
-                    pnd_wfirst_sysphase_q <= HWRITE && (HBURST != HB_INCR) && !HREADY;
-                  end
-                end
-              end
-
-              if ((beat_cnt - 8'd1) != 8'd0) begin
-                beat_cnt   <= beat_cnt - 8'd1;
-                incr_drain <= 1'b1;
-                state      <= ST_RD_DRAIN;
-              end else begin
-                beat_cnt   <= 8'd0;
-                incr_drain <= 1'b0;
-                incr_rd    <= 1'b0;
-                ar_done    <= 1'b0;
-                state      <= ST_RD_FENCE;
-              end
-
-            end else begin
             if (!pnd_valid &&
                 HSEL && HREADYIN &&
                 (HTRANS == TRN_NONSEQ) &&
-                rd_live_interleave) begin
+                (HWRITE || (HADDR != ap_addr) || (HSIZE != ap_size))) begin
               // Latch a *different* pending NONSEQ as soon as it becomes visible,
               // even if we are still holding or capturing read data.
               //
@@ -1163,65 +981,16 @@ module ahb_to_axi4_burst #(
               pnd_prot  <= HPROT;
               pnd_lock  <= HMASTLOCK;
               pnd_wfirst_valid <= 1'b0;
-              pnd_wfirst_sysphase_q <= HWRITE && (HBURST != HB_INCR) && !HREADY;
             end
 
             // ?????? Normal R-beat delivery ????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
             if (rd_buf_valid) begin
+            rd_buf_valid <= 1'b0;
+
             if (rd_buf_resp[1]) begin
-              rd_buf_valid <= 1'b0;
               state <= ST_RD_ERR;
 
-            end else if (incr_rd && (beat_cnt != 8'd0) && rd_q_interleave) begin
-              // Keep the buffered beat until AHB can actually accept it.
-              // Clearing rd_buf_valid here would drop a read beat while
-              // HREADY=0 during a no-idle interleave stall.
-
-            end else if (!incr_rd && (beat_cnt != 8'd0) &&
-                         (pnd_valid || rd_q_interleave)) begin
-              // Fixed-length read: a distinct follow-on transfer became visible
-              // before this burst's AXI tail was fully retired.
-              //
-              // IMPORTANT: by the time this branch runs, rd_buf_valid=1 means
-              // the current beat is already buffered and will be accepted on
-              // AHB in this cycle.  Do NOT hold HREADY low here, or the bridge
-              // will "retire" the buffered beat under stall and lose read-data
-              // alignment (DBG_TRIP_RD_POP_NO_HREADY / Linux boot failure).
-              //
-              // So:
-              //   - deliver the *current* buffered beat normally this cycle
-              //   - latch the pending follow-on transfer if needed
-              //   - then drain only the *remaining* AXI tail under ST_RD_DRAIN
-              //     before fencing into the next transaction
-              rd_buf_valid <= 1'b0;
-
-              if (!pnd_valid && rd_q_nonseq) begin
-                pnd_valid <= 1'b1;
-                pnd_addr  <= haddr_q;
-                pnd_size  <= hsize_q;
-                pnd_burst <= hburst_q;
-                pnd_write <= hwrite_q;
-                pnd_prot  <= hprot_q;
-                pnd_lock  <= hmastlock_q;
-                pnd_wfirst_valid <= 1'b0;
-              end
-
-              if ((beat_cnt - 8'd1) != 8'd0) begin
-                beat_cnt   <= beat_cnt - 8'd1;
-                incr_drain <= 1'b1;
-                state      <= ST_RD_DRAIN;
-              end else begin
-                beat_cnt   <= 8'd0;
-                incr_drain <= 1'b0;
-                incr_rd    <= 1'b0;
-                ar_done    <= 1'b0;
-                state      <= ST_RD_FENCE;
-              end
-
-            end else begin
-              rd_buf_valid <= 1'b0;
-
-            if (beat_cnt != 8'd0) begin
+            end else if (beat_cnt != 8'd0) begin
               // ?????? Mid-burst beat ????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
               beat_cnt <= beat_cnt - 8'd1;
 
@@ -1277,36 +1046,19 @@ module ahb_to_axi4_burst #(
               // For non-INCR reads: unconditional decrement (no mid-burst check).
 
             end else begin
-              // ?????? Last beat (beat_cnt == 0) ??? boundary handoff ?????????????????????????????????????????????????????????????
+              // ?????? Last beat (beat_cnt == 0) ??? lookahead ???????????????????????????????????????????????????????????????????????????
               //
-              // For the same-address read->read bug, the accepted q-view can
-              // already hold burst2 beat0 NONSEQ while the live bus has advanced
-              // to burst2 beat1 SEQ.  But we must NOT trust q-view unconditionally
-              // here, because stale q NONSEQ can be re-consumed and hang other
-              // handoff tests.
+              // IMPORTANT:
+              //   The final read-data beat and the next AHB address phase can
+              //   legally overlap in the SAME cycle.  For this boundary we must
+              //   look at the live AHB bus, not the registered *_q view,
+              //   otherwise a completed single-read error/recovery sequence can
+              //   re-consume a stale prior NONSEQ from *_q.
               //
-              // So only treat q-view as the next transaction when the live bus
-              // has already advanced to a later SEQ beat of that same burst.
-              //
-              // Linux can get several beats ahead here: burst2 beat0 NONSEQ is
-              // already in q-view while the live bus is on burst2 beatN SEQ by
-              // the time burst1's final read beat retires. Requiring exactly
-              // beat1 misses that legitimate handoff and the bridge drops or
-              // replays the queued same-address burst.
-              if (rd_q_nonseq && !hwrite_q &&
-                  q_live_seq_same_burst_progress) begin
-                pnd_valid <= 1'b1;
-                pnd_addr  <= haddr_q;
-                pnd_size  <= hsize_q;
-                pnd_burst <= hburst_q;
-                pnd_write <= hwrite_q;
-                pnd_prot  <= hprot_q;
-                pnd_lock  <= hmastlock_q;
-                incr_rd   <= 1'b0;
-                ar_done   <= 1'b0;
-                pnd_wfirst_sysphase_q <= 1'b0;
-                state     <= ST_RD_FENCE;
-              end else if (HSEL && HREADYIN && (HTRANS == TRN_NONSEQ)) begin
+              // Mid-burst handling still uses the registered view so the
+              // current-beat HREADY decision and the sequential transition stay
+              // aligned.  Only this last-beat handoff uses the live lookahead.
+              if (HSEL && HREADYIN && (HTRANS == TRN_NONSEQ)) begin
                 // Do NOT launch the next transaction directly from the last-beat cycle.
                 // First fence off any late stale AXI R beats from the just-completed read.
                 pnd_valid <= 1'b1;
@@ -1318,7 +1070,6 @@ module ahb_to_axi4_burst #(
                 pnd_lock  <= HMASTLOCK;
                 incr_rd   <= 1'b0;
                 ar_done   <= 1'b0;
-                pnd_wfirst_sysphase_q <= HWRITE && (HBURST != HB_INCR) && !HREADY;
                 state     <= ST_RD_FENCE;
               end else if (incr_rd && (HTRANS == TRN_SEQ)) begin
                 // INCR read continuation: chunk consumed, master wants more.
@@ -1336,8 +1087,6 @@ module ahb_to_axi4_burst #(
                 incr_rd <= 1'b0;
                 state   <= ST_RD_FENCE;
               end
-            end
-            end
             end
             end
           end
@@ -1378,42 +1127,8 @@ module ahb_to_axi4_burst #(
         // Error drain: HREADY=1 (original behaviour, master already got error).
         // INCR early-termination drain: HREADY=0 (stall master until done).
         ST_RD_DRAIN: begin
-          if (rd_buf_valid)
+          if (rd_buf_valid) begin
             rd_buf_valid <= 1'b0;
-
-          if (rd_sameaddr_followon_cand) begin
-            if (HSEL && (HTRANS == TRN_NONSEQ) && !HWRITE &&
-                (HADDR == rd_sameaddr_followon_addr) &&
-                (HSIZE == rd_sameaddr_followon_size)) begin
-              pnd_valid <= 1'b1;
-              pnd_addr  <= rd_sameaddr_followon_addr;
-              pnd_size  <= rd_sameaddr_followon_size;
-              pnd_burst <= rd_sameaddr_followon_burst;
-              pnd_write <= 1'b0;
-              pnd_prot  <= rd_sameaddr_followon_prot;
-              pnd_lock  <= rd_sameaddr_followon_lock;
-              pnd_wfirst_valid <= 1'b0;
-              rd_sameaddr_followon_cand <= 1'b0;
-            end else if (rd_sameaddr_followon_live_seq_progress) begin
-              // The full-system AHB fabric can advance the live bus from the
-              // unaccepted same-address NONSEQ to a later SEQ while this bridge
-              // is still draining stale R beats.  That SEQ proves the candidate
-              // was a real follow-on burst, not a glitch, so keep/restart beat0.
-              pnd_valid <= 1'b1;
-              pnd_addr  <= rd_sameaddr_followon_addr;
-              pnd_size  <= rd_sameaddr_followon_size;
-              pnd_burst <= rd_sameaddr_followon_burst;
-              pnd_write <= 1'b0;
-              pnd_prot  <= rd_sameaddr_followon_prot;
-              pnd_lock  <= rd_sameaddr_followon_lock;
-              pnd_wfirst_valid <= 1'b0;
-              rd_sameaddr_followon_cand <= 1'b0;
-            end else if (HSEL && HTRANS[1]) begin
-              rd_sameaddr_followon_cand <= 1'b0;
-            end
-          end
-
-          if (raw_r_accept || rd_buf_valid) begin
             if (beat_cnt != 8'd0)
               beat_cnt <= beat_cnt - 8'd1;
             else begin
@@ -1427,8 +1142,7 @@ module ahb_to_axi4_burst #(
         ST_RD_FENCE: begin
           // Drain any late stale AXI R beats that appear after the logical end
           // of the previous read transaction, before allowing the next read.
-          // One empty cycle is not enough; require two consecutive clean cycles
-          // after the AXI read is fully retired.
+          // One empty cycle is not enough; require two consecutive clean cycles.
           //
           // If a fixed-length pending WRITE was already latched during the last
           // read-beat overlap, preserve its first data beat here as soon as the
@@ -1442,45 +1156,22 @@ module ahb_to_axi4_burst #(
           ar_done <= 1'b0;
 
           if (pnd_valid && pnd_write && (pnd_burst != HB_INCR) &&
-              !pnd_wfirst_valid && pnd_wfirst_capture_ok &&
+              !pnd_wfirst_valid && ahb_wphase_valid &&
+              (ahb_waddr_d == pnd_addr) && (ahb_wsize_d == pnd_size) &&
               !pnd_same_live_write_addrphase) begin
             pnd_wfirst_valid <= 1'b1;
             pnd_wfirst_data  <= HWDATA;
-            pnd_wfirst_strb  <= pnd_wfirst_capture_strb;
+            pnd_wfirst_strb  <= ahb_wstrb_d;
           end
 
           if (rd_buf_valid) begin
             rd_buf_valid        <= 1'b0;
             rd_fence_seen_idle  <= 1'b0;
 
-          end else if (RVALID || dbg_rd_outstanding) begin
+          end else if (RVALID) begin
             rd_fence_seen_idle  <= 1'b0;
 
           end else if (!rd_fence_seen_idle) begin
-            if (rd_sameaddr_followon_cand) begin
-              if (HSEL && (HTRANS == TRN_NONSEQ) && !HWRITE &&
-                  (HADDR == rd_sameaddr_followon_addr) &&
-                  (HSIZE == rd_sameaddr_followon_size)) begin
-                pnd_valid <= 1'b1;
-                pnd_addr  <= rd_sameaddr_followon_addr;
-                pnd_size  <= rd_sameaddr_followon_size;
-                pnd_burst <= rd_sameaddr_followon_burst;
-                pnd_write <= 1'b0;
-                pnd_prot  <= rd_sameaddr_followon_prot;
-                pnd_lock  <= rd_sameaddr_followon_lock;
-                pnd_wfirst_valid <= 1'b0;
-              end else if (rd_sameaddr_followon_live_seq_progress) begin
-                pnd_valid <= 1'b1;
-                pnd_addr  <= rd_sameaddr_followon_addr;
-                pnd_size  <= rd_sameaddr_followon_size;
-                pnd_burst <= rd_sameaddr_followon_burst;
-                pnd_write <= 1'b0;
-                pnd_prot  <= rd_sameaddr_followon_prot;
-                pnd_lock  <= rd_sameaddr_followon_lock;
-                pnd_wfirst_valid <= 1'b0;
-              end
-              rd_sameaddr_followon_cand <= 1'b0;
-            end
             rd_fence_seen_idle  <= 1'b1;
 
           end else begin
@@ -1546,7 +1237,7 @@ module ahb_to_axi4_burst #(
       end
 
       ST_WR_D: begin
-        HREADY = !pnd_valid;
+        HREADY = 1'b1;
       end
 
       ST_WR_FIX_FLUSH:     HREADY = !pnd_valid;
@@ -1641,19 +1332,14 @@ module ahb_to_axi4_burst #(
   // ?????? AXI4: Write Address Channel ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
   assign AWID    = '0;
   assign AWADDR  = ap_addr;
-  assign AWLEN   = ((state == ST_WR_FIX_FLUSH) || (state == ST_WR_INCR_FLUSH))
-                 ? (acc_cnt_u8 - 8'd1) : ap_axlen;
+  assign AWLEN   = (state == ST_WR_INCR_FLUSH) ? (acc_cnt - 8'd1) : ap_axlen;
   assign AWSIZE  = ap_size;
-  assign AWBURST = (state == ST_WR_INCR_FLUSH) ? AXI_INCR
-                 : (state == ST_WR_FIX_FLUSH) ? (fix_flush_full_len ? ap_axburst : AXI_INCR)
-                 : ap_axburst;
+  assign AWBURST = (state == ST_WR_INCR_FLUSH) ? AXI_INCR : ap_axburst;
   assign AWLOCK  = ap_lock;
   assign AWCACHE = {2'b00, ap_prot[3], ap_prot[2]};  // HPROT[3]=cacheable→[1], HPROT[2]=bufferable→[0]
   assign AWPROT  = hprot_to_axprot(ap_prot);
   assign AWQOS   = 4'b0000;
-  assign AWVALID = (((state == ST_WR_D) && (ap_axlen == 8'd0)) ||
-                    (state == ST_WR_FIX_FLUSH) ||
-                    (state == ST_WR_INCR_FLUSH)) && !aw_sent;
+  assign AWVALID = ((state == ST_WR_D) || (state == ST_WR_FIX_FLUSH) || (state == ST_WR_INCR_FLUSH)) && !aw_sent;
 
   // In ST_WR_D, consume a fixed-write beat only when it is already latched
   // (pnd_wfirst_valid) or when the previous accepted AHB address phase proves
@@ -1810,56 +1496,12 @@ module ahb_to_axi4_burst #(
   assign dbg_w_fire      = WVALID && WREADY;
   assign dbg_b_fire      = BVALID && BREADY;
 
-  // BUG21: a live NONSEQ must only be treated as a new transfer when this
-  // slave actually accepted the AHB address phase.  HREADYIN alone is not
-  // sufficient; if our HREADY is 0 then the master is still holding an
-  // unaccepted request on the bus and we must not latch it as pending.
-  assign rd_live_nonseq_raw  = HSEL && HREADYIN && (HTRANS == TRN_NONSEQ);
-  assign rd_live_nonseq      = rd_live_nonseq_raw && HREADY;
+  assign rd_live_nonseq      = HSEL && HREADYIN && (HTRANS == TRN_NONSEQ);
   assign rd_q_nonseq         = hsel_q && hreadyin_q && (htrans_q == TRN_NONSEQ);
-
-  // In ST_RD_D the current read's initial NONSEQ can remain visible on the AHB
-  // bus until the first read beat is actually delivered because HREADY stays low
-  // while waiting for AXI RDATA.  That held NONSEQ is NOT a new transaction and
-  // must not be latched as pending.
-  //
-  // After at least one beat has been delivered, however, any later NONSEQ seen
-  // during ST_RD_D is a distinct next transaction even if address and size are
-  // identical to the active read.  This is the same-address same-size read-to-read
-  // handoff that Linux hit.
-  assign rd_live_sameaddr_followon_raw =
-      rd_live_nonseq_raw && !HWRITE &&
-      (HADDR == ap_addr) && (HSIZE == ap_size) &&
-      (beat_cnt != ap_axlen);
-  assign rd_live_interleave_raw =
-      HWRITE || (rd_live_nonseq_raw &&
-                 (((HADDR != ap_addr) || (HSIZE != ap_size))
-                  || (beat_cnt != ap_axlen)));
   assign rd_live_interleave  = HWRITE || (rd_live_nonseq &&
-                                          (((HADDR != ap_addr) || (HSIZE != ap_size))
-                                           || (beat_cnt != ap_axlen)));
-  wire rd_q_is_stale_current_nonseq =
-      rd_q_holds_current_start &&
-      rd_q_nonseq && !hwrite_q &&
-      (haddr_q == ap_addr) &&
-      (hsize_q == ap_size);
+                                          ((HADDR != ap_addr) || (HSIZE != ap_size)));
   assign rd_q_interleave     = hwrite_q || (rd_q_nonseq &&
-                                            (((haddr_q != ap_addr) || (hsize_q != ap_size))
-                                             || ((beat_cnt != ap_axlen)
-                                                 && !rd_q_is_stale_current_nonseq)));
-  wire [AW-1:0] q_beat_bytes = ({{(AW-1){1'b0}}, 1'b1} << hsize_q);
-  wire q_live_seq_same_burst_progress =
-      HSEL && HREADYIN && (HTRANS == TRN_SEQ) && !HWRITE &&
-      (HSIZE  == hsize_q) &&
-      (HBURST == hburst_q) &&
-      (HADDR  >= (haddr_q + q_beat_bytes));
-  wire [AW-1:0] rd_sameaddr_followon_beat_bytes =
-      ({{(AW-1){1'b0}}, 1'b1} << rd_sameaddr_followon_size);
-  wire rd_sameaddr_followon_live_seq_progress =
-      HSEL && HREADYIN && (HTRANS == TRN_SEQ) && !HWRITE &&
-      (HSIZE  == rd_sameaddr_followon_size) &&
-      (HBURST == rd_sameaddr_followon_burst) &&
-      (HADDR  >= (rd_sameaddr_followon_addr + rd_sameaddr_followon_beat_bytes));
+                                            ((haddr_q != ap_addr) || (hsize_q != ap_size)));
 
   assign pnd_same_live_write_addrphase =
       HSEL && HREADYIN && HWRITE && HTRANS[1] &&
@@ -1869,9 +1511,6 @@ module ahb_to_axi4_burst #(
   assign dbg_q_interleave    = rd_q_interleave;
 
   logic pnd_wfirst_capture_ok;
-  logic pnd_wfirst_sysphase_capture_ok;
-  logic pnd_wfirst_live_seq_capture_ok;
-  logic [DW/8-1:0] pnd_wfirst_capture_strb;
   logic dbg_rd_deliver_fire;
   logic [15:0] dbg_rd_capture_seq;
   logic [15:0] dbg_rd_buf_capture_seq;
@@ -1882,46 +1521,9 @@ module ahb_to_axi4_burst #(
   logic [7:0]  dbg_prev_beat_cnt;
   state_t      dbg_prev_cycle_state;
 
-  // A pending fixed write's beat-0 data is normally proven by the delayed AHB
-  // write-phase tracker.  If the address was latched while the bridge was
-  // holding its own HREADY low, pnd_wfirst_sysphase_q marks the one following
-  // system data phase so that beat 0 is captured before the live address phase
-  // disappears from this slave.
-  wire [AW-1:0] pnd_beat_bytes = ({{(AW-1){1'b0}}, 1'b1} << pnd_size);
-
-  // If a pending fixed INCR write was latched while this slave held HREADY low,
-  // the master may already be parked on SEQ beat 1.  In that condition HWDATA
-  // is still beat 0, but the delayed address-phase tracker was never updated.
-  //
-  // Keep this escape hatch scoped to ST_WR_PND_ALIGN.  Outside that state, the
-  // normal delayed write-phase tracker is the only safe proof of HWDATA phase.
-  assign pnd_wfirst_live_seq_capture_ok =
-      (state == ST_WR_PND_ALIGN) &&
-      pnd_write && (pnd_burst != HB_INCR) &&
-      !pnd_wfirst_valid &&
-      (ap_addr == pnd_addr) &&
-      HSEL && HWRITE && (HTRANS == TRN_SEQ) &&
-      (pnd_c_axburst == AXI_INCR) &&
-      (HSIZE == pnd_size) &&
-      (HBURST == pnd_burst) &&
-      (HADDR == (pnd_addr + pnd_beat_bytes));
-
-  assign pnd_wfirst_sysphase_capture_ok =
-      pnd_wfirst_sysphase_q &&
-      pnd_valid &&
-      pnd_write && (pnd_burst != HB_INCR) &&
-      !pnd_wfirst_valid;
-
-  assign pnd_wfirst_capture_ok = (ahb_wphase_valid
-                               && (ahb_waddr_d == pnd_addr)
-                               && (ahb_wsize_d == pnd_size))
-                              || pnd_wfirst_sysphase_capture_ok
-                              || pnd_wfirst_live_seq_capture_ok;
-
-  assign pnd_wfirst_capture_strb = (pnd_wfirst_live_seq_capture_ok ||
-                                    pnd_wfirst_sysphase_capture_ok)
-                                 ? ahb_addrsize_to_wstrb(pnd_addr, pnd_size)
-                                 : ahb_wstrb_d;
+  assign pnd_wfirst_capture_ok = ahb_wphase_valid
+                              && (ahb_waddr_d == pnd_addr)
+                              && (ahb_wsize_d == pnd_size);
 
   assign dbg_rd_deliver_fire = (state == ST_RD_D)
                             && rd_buf_valid
@@ -2085,7 +1687,7 @@ module ahb_to_axi4_burst #(
       (beat_cnt != 8'd0) &&
       (dbg_live_interleave != dbg_q_interleave) &&
       !(HSEL && HREADYIN && (HTRANS == TRN_NONSEQ) &&
-        rd_live_interleave);
+        (HWRITE || (HADDR != ap_addr) || (HSIZE != ap_size)));
 
   assign dbg_trip_rd_repeat_deliver_p =
       dbg_rd_deliver_fire &&
@@ -2516,7 +2118,7 @@ module ahb_to_axi4_burst #(
       if ((state == ST_RD_D) && rd_buf_valid && (beat_cnt != 8'd0) &&
           (dbg_live_interleave != dbg_q_interleave) &&
           !(HSEL && HREADYIN && (HTRANS == TRN_NONSEQ) &&
-            rd_live_interleave)) begin
+            (HWRITE || (HADDR != ap_addr) || (HSIZE != ap_size)))) begin
         if (!dbg_rd_live_q_disagree) begin
           dbg_rd_live_q_disagree <= 1'b1;
           dbg_rd_live_q_cycle    <= dbg_cycle_counter;

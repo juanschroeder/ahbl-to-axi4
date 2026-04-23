@@ -1,0 +1,21 @@
+[tasks]
+bmc
+cover
+
+[options]
+bmc:   mode bmc
+bmc:   depth 60
+cover: mode cover
+cover: depth 40
+
+[engines]
+smtbmc yices
+
+[script]
+read_verilog -formal -sv ahb_to_axi4_burst_v11c_sby.sv
+read_verilog -formal -sv ahb_to_axi4_burst_linux_hang_fv.sv
+prep -top ahb_to_axi4_burst_v11c_linux_hang_fv
+
+[files]
+formal/ahb_to_axi4_burst_v11c_sby.sv
+formal/ahb_to_axi4_burst_linux_hang_fv.sv

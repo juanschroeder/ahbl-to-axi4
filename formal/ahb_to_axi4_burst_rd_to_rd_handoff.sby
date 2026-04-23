@@ -1,0 +1,22 @@
+[tasks]
+bmc
+cover
+
+[options]
+bmc: mode bmc
+bmc: depth 100
+cover: mode cover
+cover: depth 40
+
+[engines]
+bmc: abc bmc3
+cover: smtbmc --progress yices
+
+[script]
+read_verilog -formal -sv ahb_to_axi4_burst_formal_tap.sv
+read_verilog -formal -sv ahb_to_axi4_burst_rd_to_rd_handoff_fv.sv
+prep -top ahb_to_axi4_burst_rd_to_rd_handoff_fv
+
+[files]
+rtl/ahb_to_axi4_burst_formal_tap.sv
+formal/ahb_to_axi4_burst_rd_to_rd_handoff_fv.sv
