@@ -260,8 +260,10 @@ module ahb_to_axi4_burst #(
   // These are intentionally separate from dbg_* so the fix does not depend on
   // debug instrumentation being kept.
   logic             rd_live_nonseq_raw;
+  logic             rd_live_write_raw;
   logic             rd_live_interleave_raw;
   logic             rd_live_nonseq;
+  logic             rd_live_write;
   logic             rd_live_sameaddr_followon_raw;
   logic             rd_sameaddr_followon_cand;
   logic [AW-1:0]    rd_sameaddr_followon_addr;
@@ -270,6 +272,7 @@ module ahb_to_axi4_burst #(
   logic [3:0]       rd_sameaddr_followon_prot;
   logic             rd_sameaddr_followon_lock;
   logic             rd_q_nonseq;
+  logic             rd_q_write;
   logic             rd_live_interleave;
   logic             rd_q_interleave;
   logic             pnd_same_live_write_addrphase;
@@ -1815,8 +1818,11 @@ module ahb_to_axi4_burst #(
   // sufficient; if our HREADY is 0 then the master is still holding an
   // unaccepted request on the bus and we must not latch it as pending.
   assign rd_live_nonseq_raw  = HSEL && HREADYIN && (HTRANS == TRN_NONSEQ);
+  assign rd_live_write_raw   = HSEL && HREADYIN && HTRANS[1] && HWRITE;
   assign rd_live_nonseq      = rd_live_nonseq_raw && HREADY;
+  assign rd_live_write       = rd_live_write_raw && HREADY;
   assign rd_q_nonseq         = hsel_q && hreadyin_q && (htrans_q == TRN_NONSEQ);
+  assign rd_q_write          = hsel_q && hreadyin_q && htrans_q[1] && hwrite_q;
 
   // In ST_RD_D the current read's initial NONSEQ can remain visible on the AHB
   // bus until the first read beat is actually delivered because HREADY stays low
@@ -1832,18 +1838,18 @@ module ahb_to_axi4_burst #(
       (HADDR == ap_addr) && (HSIZE == ap_size) &&
       (beat_cnt != ap_axlen);
   assign rd_live_interleave_raw =
-      HWRITE || (rd_live_nonseq_raw &&
-                 (((HADDR != ap_addr) || (HSIZE != ap_size))
-                  || (beat_cnt != ap_axlen)));
-  assign rd_live_interleave  = HWRITE || (rd_live_nonseq &&
-                                          (((HADDR != ap_addr) || (HSIZE != ap_size))
-                                           || (beat_cnt != ap_axlen)));
+      rd_live_write_raw || (rd_live_nonseq_raw &&
+                            (((HADDR != ap_addr) || (HSIZE != ap_size))
+                             || (beat_cnt != ap_axlen)));
+  assign rd_live_interleave  = rd_live_write || (rd_live_nonseq &&
+                                                 (((HADDR != ap_addr) || (HSIZE != ap_size))
+                                                  || (beat_cnt != ap_axlen)));
   wire rd_q_is_stale_current_nonseq =
       rd_q_holds_current_start &&
       rd_q_nonseq && !hwrite_q &&
       (haddr_q == ap_addr) &&
       (hsize_q == ap_size);
-  assign rd_q_interleave     = hwrite_q || (rd_q_nonseq &&
+  assign rd_q_interleave     = rd_q_write || (rd_q_nonseq &&
                                             (((haddr_q != ap_addr) || (hsize_q != ap_size))
                                              || ((beat_cnt != ap_axlen)
                                                  && !rd_q_is_stale_current_nonseq)));
@@ -2646,5 +2652,6 @@ module ahb_to_axi4_burst #(
     end
   end
 
-`default_nettype wire
 endmodule
+
+`default_nettype wire

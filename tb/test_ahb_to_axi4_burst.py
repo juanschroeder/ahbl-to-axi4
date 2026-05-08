@@ -14847,3 +14847,99 @@ async def test_regression_bug22h_latched_read_after_write_beat_flushes_partial_w
         "BUG22H: partial write flushed but pending read was not dispatched; "
         f"state={int(dut.dut.state.value)} pnd_valid={int(dut.dut.pnd_valid.value)}"
     )
+
+
+@cocotb.test()
+async def test_regression_incr8_read_must_not_complete_before_axi_r(dut):
+    set_test_id(dut)
+    await setup_dut_no_axi_slave(dut)
+
+    start_addr = 0x8051E1C0
+    expected = [0xABCD_0000_8051_E100 | beat for beat in range(8)]
+    seen = []
+
+    await FallingEdge(dut.clk)
+    dut.hsel.value = 1
+    dut.hreadyin.value = 1
+    dut.haddr.value = start_addr
+    dut.hburst.value = 0b101
+    dut.hmastlock.value = 0
+    dut.hprot.value = 0
+    dut.hsize.value = 0b011
+    dut.htrans.value = AHB_NONSEQ
+    dut.hwrite.value = 0
+    dut.hwdata.value = 0
+
+    # The combinational HREADY=1 from IDLE accepts this NONSEQ on the edge;
+    # after the edge the DUT has already moved to ST_RD_A and HREADY is low.
+    await RisingEdge(dut.clk)
+    await NextTimeStep()
+    dut.haddr.value = start_addr + 8
+    dut.htrans.value = AHB_SEQ
+
+    while not int(dut.m_axi_arvalid.value):
+        await RisingEdge(dut.clk)
+    assert int(dut.m_axi_araddr.value) == start_addr
+    assert int(dut.m_axi_arlen.value) == 7
+    dut.m_axi_arready.value = 1
+    await RisingEdge(dut.clk)
+    await NextTimeStep()
+    dut.m_axi_arready.value = 0
+    await RisingEdge(dut.clk)
+    await NextTimeStep()
+    trace = deque(maxlen=48)
+
+    async def drive_r_and_accept_ahb_beat(beat, data):
+        if beat == 2:
+            # HWRITE is not meaningful during an IDLE/no-transfer address
+            # phase.  The read-data path must not treat this stale value as a
+            # write interleave and drop the concurrent AXI R beat.
+            dut.htrans.value = AHB_IDLE
+            dut.hwrite.value = 1
+
+        dut.m_axi_rdata.value = data
+        dut.m_axi_rresp.value = 0
+        dut.m_axi_rlast.value = 1 if beat == 7 else 0
+        dut.m_axi_rvalid.value = 1
+
+        for _ in range(64):
+            await ReadOnly()
+            trace.append(_bug20_snapshot(dut, f"beat{beat}:preedge"))
+            if int(dut.hready.value):
+                assert int(dut.m_axi_rvalid.value) or int(dut.dut.rd_buf_valid.value), (
+                    "AHB read data phase completed without a current buffered/valid "
+                    f"AXI R beat: beat={beat}, HADDR=0x{int(dut.haddr.value):08x}, "
+                    f"state={int(dut.dut.state.value)}, rd_buf_valid={int(dut.dut.rd_buf_valid.value)}"
+                )
+                seen.append(int(dut.hrdata.value))
+                await NextTimeStep()
+                dut.m_axi_rvalid.value = 0
+                dut.m_axi_rlast.value = 0
+                if beat == 7:
+                    _init_direct_ahb_signals(dut)
+                else:
+                    dut.haddr.value = start_addr + (beat + 1) * 8
+                    dut.htrans.value = AHB_SEQ
+                    dut.hwrite.value = 0
+                    await RisingEdge(dut.clk)
+                    await NextTimeStep()
+                return
+            await RisingEdge(dut.clk)
+            await ReadOnly()
+            trace.append(_bug20_snapshot(dut, f"beat{beat}:postedge"))
+        raise AssertionError(
+            f"timed out waiting for AHB read beat {beat}: "
+            f"state={int(dut.dut.state.value)} beat_cnt={int(dut.dut.beat_cnt.value)} "
+            f"rd_buf_valid={int(dut.dut.rd_buf_valid.value)} "
+            f"ar_done={int(dut.dut.ar_done.value)} "
+            f"R={int(dut.m_axi_rvalid.value)}/{int(dut.m_axi_rready.value)} "
+            f"HREADY={int(dut.hready.value)}\n{_bug20_format_trace(trace)}"
+        )
+
+    for beat, data in enumerate(expected):
+        await drive_r_and_accept_ahb_beat(beat, data)
+
+    assert seen == expected, (
+        "fixed INCR8 read returned misaligned data after stale IDLE/HWRITE phase: "
+        f"seen={[hex(x) for x in seen]} expected={[hex(x) for x in expected]}"
+    )
