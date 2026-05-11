@@ -14943,3 +14943,164 @@ async def test_regression_incr8_read_must_not_complete_before_axi_r(dut):
         "fixed INCR8 read returned misaligned data after stale IDLE/HWRITE phase: "
         f"seen={[hex(x) for x in seen]} expected={[hex(x) for x in expected]}"
     )
+
+
+@cocotb.test()
+async def test_regression_read_fence_hreadyin_nonseq_must_be_latched(dut):
+    set_test_id(dut)
+    await setup_dut_no_axi_slave(dut)
+
+    first_addr = 0x2000_0010
+    second_addr = 0x802C_AA00
+
+    # First complete a normal SINGLE read.  This puts the bridge into
+    # ST_RD_FENCE after the read beat is delivered.
+    await FallingEdge(dut.clk)
+    dut.hsel.value = 1
+    dut.hreadyin.value = 1
+    dut.haddr.value = first_addr
+    dut.hburst.value = AHB_BURST_SINGLE
+    dut.hmastlock.value = 0
+    dut.hprot.value = 0
+    dut.hsize.value = 0b010
+    dut.htrans.value = AHB_NONSEQ
+    dut.hwrite.value = 0
+    dut.hwdata.value = 0
+
+    await RisingEdge(dut.clk)
+    await NextTimeStep()
+    dut.hsel.value = 0
+    dut.htrans.value = AHB_IDLE
+    dut.haddr.value = 0
+
+    while not int(dut.m_axi_arvalid.value):
+        await RisingEdge(dut.clk)
+    assert int(dut.m_axi_araddr.value) == first_addr
+    assert int(dut.m_axi_arlen.value) == 0
+    dut.m_axi_arready.value = 1
+    await RisingEdge(dut.clk)
+    await NextTimeStep()
+    dut.m_axi_arready.value = 0
+
+    dut.m_axi_rdata.value = 0x0000_0000_0000_0120
+    dut.m_axi_rresp.value = 0
+    dut.m_axi_rlast.value = 1
+    dut.m_axi_rvalid.value = 1
+
+    for _ in range(32):
+        await ReadOnly()
+        if int(dut.hready.value) and int(dut.hrdata.value) == 0x120:
+            break
+        await RisingEdge(dut.clk)
+    else:
+        raise AssertionError("setup: first read did not complete before fence handoff")
+
+    # Retire the buffered read beat and enter ST_RD_FENCE.  Keep the live AHB
+    # bus idle/deselected while the first clean fence cycle is consumed.
+    await RisingEdge(dut.clk)
+    await NextTimeStep()
+    dut.m_axi_rvalid.value = 0
+    dut.m_axi_rlast.value = 0
+    dut.hsel.value = 0
+    dut.hreadyin.value = 1
+    dut.haddr.value = 0
+    dut.hburst.value = AHB_BURST_SINGLE
+    dut.hmastlock.value = 0
+    dut.hprot.value = 0
+    dut.hsize.value = AHB_SIZE_8
+    dut.htrans.value = AHB_IDLE
+    dut.hwrite.value = 0
+    dut.hwdata.value = 0
+
+    # This is the part the old test did NOT force.  Wait until the fence has
+    # already seen one clean cycle, so the next clock edge will take the final
+    # ST_RD_FENCE exit path:
+    #
+    #     state == ST_RD_FENCE && rd_fence_seen_idle == 1
+    #
+    # v24 did not latch a read NONSEQ on that final-exit edge.  v25d does.
+    saw_final_exit_point = False
+    for _ in range(64):
+        await RisingEdge(dut.clk)
+        await ReadOnly()
+        if (
+            int(dut.dut.state.value) == 16 and  # ST_RD_FENCE
+            int(dut.dut.rd_fence_seen_idle.value) == 1 and
+            int(dut.hready.value) == 0 and
+            int(dut.dut.rd_buf_valid.value) == 0 and
+            int(dut.m_axi_rvalid.value) == 0
+        ):
+            saw_final_exit_point = True
+            break
+        await NextTimeStep()
+
+    assert saw_final_exit_point, (
+        "setup: never reached final ST_RD_FENCE exit point; "
+        f"state={int(dut.dut.state.value)} "
+        f"rd_fence_seen_idle={int(dut.dut.rd_fence_seen_idle.value)} "
+        f"hready={int(dut.hready.value)} rd_buf_valid={int(dut.dut.rd_buf_valid.value)}"
+    )
+
+    await NextTimeStep()
+
+    # Present the second read NONSEQ exactly on the final clean fence-exit
+    # cycle.  HREADYOUT is still low, but HREADYIN is high, matching the
+    # long-run fabric behavior that let the live upstream bus advance.
+    dut.hsel.value = 1
+    dut.hreadyin.value = 1
+    dut.haddr.value = second_addr
+    dut.hburst.value = 0b101      # INCR8
+    dut.hmastlock.value = 0
+    dut.hprot.value = 0
+    dut.hsize.value = AHB_SIZE_8
+    dut.htrans.value = AHB_NONSEQ
+    dut.hwrite.value = 0
+    dut.hwdata.value = 0
+
+    await RisingEdge(dut.clk)
+    await ReadOnly()
+
+    assert int(dut.dut.pnd_valid.value) == 1, (
+        "BUG25: read NONSEQ on final ST_RD_FENCE exit was not latched; "
+        f"state={int(dut.dut.state.value)} "
+        f"rd_fence_seen_idle={int(dut.dut.rd_fence_seen_idle.value)} "
+        f"HREADY={int(dut.hready.value)} HADDR=0x{int(dut.haddr.value):08x}"
+    )
+    assert int(dut.dut.pnd_write.value) == 0, "BUG25: pending transfer should be a read"
+    assert int(dut.dut.pnd_addr.value) == second_addr, (
+        f"BUG25: pnd_addr=0x{int(dut.dut.pnd_addr.value):08x}, "
+        f"expected 0x{second_addr:08x}"
+    )
+    assert int(dut.hready.value) == 0, (
+        "BUG25: bridge must keep HREADY low after latching the final-fence read "
+        "so the following SEQ cannot complete before AR is issued"
+    )
+
+    await NextTimeStep()
+    dut.haddr.value = second_addr + 8
+    dut.htrans.value = AHB_SEQ
+
+    ar_seen = False
+    for _ in range(16):
+        await RisingEdge(dut.clk)
+        await ReadOnly()
+        if int(dut.m_axi_arvalid.value):
+            ar_seen = True
+            assert int(dut.m_axi_araddr.value) == second_addr
+            assert int(dut.m_axi_arlen.value) == 7
+            break
+        assert not (
+            int(dut.hready.value)
+            and int(dut.hsel.value)
+            and int(dut.htrans.value) == AHB_SEQ
+        ), (
+            "bridge released the SEQ beat before issuing AR for the latched "
+            f"final-fence NONSEQ: HADDR=0x{int(dut.haddr.value):08x} "
+            f"HRDATA=0x{int(dut.hrdata.value):016x} state={int(dut.dut.state.value)}"
+        )
+        await NextTimeStep()
+
+    assert ar_seen, (
+        "bridge latched the final-fence read NONSEQ but did not dispatch AR; "
+        f"state={int(dut.dut.state.value)} pnd_valid={int(dut.dut.pnd_valid.value)}"
+    )

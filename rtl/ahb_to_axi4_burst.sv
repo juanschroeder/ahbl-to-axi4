@@ -1384,7 +1384,19 @@ module ahb_to_axi4_burst #(
           if (rd_buf_valid)
             rd_buf_valid <= 1'b0;
 
-          if (rd_sameaddr_followon_cand) begin
+          if (!pnd_valid && !HREADY &&
+              HSEL && HREADYIN && (HTRANS == TRN_NONSEQ) && !HWRITE) begin
+            pnd_valid <= 1'b1;
+            pnd_addr  <= HADDR;
+            pnd_size  <= HSIZE;
+            pnd_burst <= HBURST;
+            pnd_write <= 1'b0;
+            pnd_prot  <= HPROT;
+            pnd_lock  <= HMASTLOCK;
+            pnd_wfirst_valid <= 1'b0;
+            pnd_wfirst_sysphase_q <= 1'b0;
+            rd_sameaddr_followon_cand <= 1'b0;
+          end else if (rd_sameaddr_followon_cand) begin
             if (HSEL && (HTRANS == TRN_NONSEQ) && !HWRITE &&
                 (HADDR == rd_sameaddr_followon_addr) &&
                 (HSIZE == rd_sameaddr_followon_size)) begin
@@ -1460,7 +1472,19 @@ module ahb_to_axi4_burst #(
             rd_fence_seen_idle  <= 1'b0;
 
           end else if (!rd_fence_seen_idle) begin
-            if (rd_sameaddr_followon_cand) begin
+            if (!pnd_valid &&
+                HSEL && HREADYIN && (HTRANS == TRN_NONSEQ) && !HWRITE) begin
+              pnd_valid <= 1'b1;
+              pnd_addr  <= HADDR;
+              pnd_size  <= HSIZE;
+              pnd_burst <= HBURST;
+              pnd_write <= 1'b0;
+              pnd_prot  <= HPROT;
+              pnd_lock  <= HMASTLOCK;
+              pnd_wfirst_valid <= 1'b0;
+              pnd_wfirst_sysphase_q <= 1'b0;
+              rd_sameaddr_followon_cand <= 1'b0;
+            end else if (rd_sameaddr_followon_cand) begin
               if (HSEL && (HTRANS == TRN_NONSEQ) && !HWRITE &&
                   (HADDR == rd_sameaddr_followon_addr) &&
                   (HSIZE == rd_sameaddr_followon_size)) begin
@@ -1487,6 +1511,31 @@ module ahb_to_axi4_burst #(
             rd_fence_seen_idle  <= 1'b1;
 
           end else begin
+            // v25d: final fence-exit catch, restricted to burst reads.
+            //
+            // Long-run traces show an INCR8 read NONSEQ can arrive on the
+            // exact cycle where ST_RD_FENCE is already clean and about to
+            // exit.  HREADY is still low in this cycle, so the AHB beat has
+            // not completed, but v24 dropped it and then released HREADY in
+            // ST_IDLE, returning stale HRDATA without issuing AR.
+            //
+            // Do NOT apply this to HB_SINGLE: the directed single-read/error
+            // tests can still be presenting the original SINGLE NONSEQ while
+            // the fence retires, and replaying that beat deadlocks them.
+            if (!pnd_valid &&
+                HSEL && HREADYIN && (HTRANS == TRN_NONSEQ) &&
+                !HWRITE && (HBURST != HB_SINGLE)) begin
+              pnd_valid <= 1'b1;
+              pnd_addr  <= HADDR;
+              pnd_size  <= HSIZE;
+              pnd_burst <= HBURST;
+              pnd_write <= 1'b0;
+              pnd_prot  <= HPROT;
+              pnd_lock  <= HMASTLOCK;
+              pnd_wfirst_valid <= 1'b0;
+              pnd_wfirst_sysphase_q <= 1'b0;
+              rd_sameaddr_followon_cand <= 1'b0;
+            end
             rd_fence_seen_idle  <= 1'b0;
             state               <= ST_IDLE;
           end
