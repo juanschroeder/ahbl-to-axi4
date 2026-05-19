@@ -15104,3 +15104,143 @@ async def test_regression_read_fence_hreadyin_nonseq_must_be_latched(dut):
         "bridge latched the final-fence read NONSEQ but did not dispatch AR; "
         f"state={int(dut.dut.state.value)} pnd_valid={int(dut.dut.pnd_valid.value)}"
     )
+
+
+@cocotb.test()
+async def test_regression_v26_single_read_final_fence_must_be_latched(dut):
+    set_test_id(dut)
+    await setup_dut_no_axi_slave(dut)
+
+    first_addr = 0x8E00_0000
+    second_addr = 0x8E00_0008
+
+    await FallingEdge(dut.clk)
+    dut.hsel.value = 1
+    dut.hreadyin.value = 1
+    dut.haddr.value = first_addr
+    dut.hburst.value = AHB_BURST_SINGLE
+    dut.hmastlock.value = 0
+    dut.hprot.value = 0
+    dut.hsize.value = AHB_SIZE_8
+    dut.htrans.value = AHB_NONSEQ
+    dut.hwrite.value = 0
+    dut.hwdata.value = 0
+
+    await RisingEdge(dut.clk)
+    await NextTimeStep()
+    dut.hsel.value = 0
+    dut.htrans.value = AHB_IDLE
+    dut.haddr.value = 0
+
+    while not int(dut.m_axi_arvalid.value):
+        await RisingEdge(dut.clk)
+    assert int(dut.m_axi_araddr.value) == first_addr
+    assert int(dut.m_axi_arlen.value) == 0
+    dut.m_axi_arready.value = 1
+    await RisingEdge(dut.clk)
+    await NextTimeStep()
+    dut.m_axi_arready.value = 0
+
+    dut.m_axi_rdata.value = 0x2D73_6631_6D6F_722D
+    dut.m_axi_rresp.value = 0
+    dut.m_axi_rlast.value = 1
+    dut.m_axi_rvalid.value = 1
+
+    for _ in range(32):
+        await ReadOnly()
+        if int(dut.hready.value) and int(dut.hrdata.value) == 0x2D73_6631_6D6F_722D:
+            break
+        await RisingEdge(dut.clk)
+    else:
+        raise AssertionError("setup: first mtd-ram style SINGLE read did not complete")
+
+    await RisingEdge(dut.clk)
+    await NextTimeStep()
+    dut.m_axi_rvalid.value = 0
+    dut.m_axi_rlast.value = 0
+    dut.hsel.value = 0
+    dut.hreadyin.value = 1
+    dut.haddr.value = 0
+    dut.hburst.value = AHB_BURST_SINGLE
+    dut.hmastlock.value = 0
+    dut.hprot.value = 0
+    dut.hsize.value = AHB_SIZE_8
+    dut.htrans.value = AHB_IDLE
+    dut.hwrite.value = 0
+
+    saw_final_exit_point = False
+    for _ in range(64):
+        await RisingEdge(dut.clk)
+        await ReadOnly()
+        if (
+            int(dut.dut.state.value) == 16 and
+            int(dut.dut.rd_fence_seen_idle.value) == 1 and
+            int(dut.hready.value) == 0 and
+            int(dut.dut.rd_buf_valid.value) == 0 and
+            int(dut.m_axi_rvalid.value) == 0
+        ):
+            saw_final_exit_point = True
+            break
+        await NextTimeStep()
+
+    assert saw_final_exit_point, (
+        "setup: never reached clean final ST_RD_FENCE exit point; "
+        f"state={int(dut.dut.state.value)} "
+        f"rd_fence_seen_idle={int(dut.dut.rd_fence_seen_idle.value)} "
+        f"hready={int(dut.hready.value)}"
+    )
+
+    await NextTimeStep()
+    dut.hsel.value = 1
+    dut.hreadyin.value = 1
+    dut.haddr.value = second_addr
+    dut.hburst.value = AHB_BURST_SINGLE
+    dut.hmastlock.value = 0
+    dut.hprot.value = 0
+    dut.hsize.value = AHB_SIZE_8
+    dut.htrans.value = AHB_NONSEQ
+    dut.hwrite.value = 0
+
+    await RisingEdge(dut.clk)
+    await ReadOnly()
+
+    assert int(dut.dut.pnd_valid.value) == 1, (
+        "BUG26: SINGLE read NONSEQ on final ST_RD_FENCE exit was dropped; "
+        f"state={int(dut.dut.state.value)} "
+        f"rd_fence_seen_idle={int(dut.dut.rd_fence_seen_idle.value)} "
+        f"HREADY={int(dut.hready.value)} HADDR=0x{int(dut.haddr.value):08x}"
+    )
+    assert int(dut.dut.pnd_write.value) == 0
+    assert int(dut.dut.pnd_addr.value) == second_addr, (
+        f"BUG26: pnd_addr=0x{int(dut.dut.pnd_addr.value):08x}, "
+        f"expected 0x{second_addr:08x}"
+    )
+    assert int(dut.hready.value) == 0, (
+        "BUG26: bridge must keep HREADY low after latching the final-fence "
+        "SINGLE read so stale HRDATA cannot complete it"
+    )
+
+    ar_seen = False
+    for _ in range(16):
+        await RisingEdge(dut.clk)
+        await ReadOnly()
+        if int(dut.m_axi_arvalid.value):
+            ar_seen = True
+            assert int(dut.m_axi_araddr.value) == second_addr
+            assert int(dut.m_axi_arlen.value) == 0
+            break
+        assert not (
+            int(dut.hready.value)
+            and int(dut.hsel.value)
+            and int(dut.htrans.value) == AHB_NONSEQ
+            and int(dut.haddr.value) == second_addr
+        ), (
+            "bridge released the final-fence SINGLE read before issuing AR: "
+            f"HRDATA=0x{int(dut.hrdata.value):016x} state={int(dut.dut.state.value)}"
+        )
+        await NextTimeStep()
+
+    assert ar_seen, (
+        "bridge latched the final-fence SINGLE read but did not dispatch AR; "
+        f"state={int(dut.dut.state.value)} pnd_valid={int(dut.dut.pnd_valid.value)}"
+    )

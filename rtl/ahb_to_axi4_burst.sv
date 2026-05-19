@@ -1309,7 +1309,7 @@ module ahb_to_axi4_burst #(
                 ar_done   <= 1'b0;
                 pnd_wfirst_sysphase_q <= 1'b0;
                 state     <= ST_RD_FENCE;
-              end else if (HSEL && HREADYIN && (HTRANS == TRN_NONSEQ)) begin
+              end else if ((HTRANS == TRN_NONSEQ) && rd_live_interleave_raw) begin
                 // Do NOT launch the next transaction directly from the last-beat cycle.
                 // First fence off any late stale AXI R beats from the just-completed read.
                 pnd_valid <= 1'b1;
@@ -1511,20 +1511,22 @@ module ahb_to_axi4_burst #(
             rd_fence_seen_idle  <= 1'b1;
 
           end else begin
-            // v25d: final fence-exit catch, restricted to burst reads.
+            // v26: final fence-exit catch for new read address phases.
             //
-            // Long-run traces show an INCR8 read NONSEQ can arrive on the
+            // Long-run traces show a read NONSEQ can arrive on the
             // exact cycle where ST_RD_FENCE is already clean and about to
             // exit.  HREADY is still low in this cycle, so the AHB beat has
-            // not completed, but v24 dropped it and then released HREADY in
+            // not completed, but dropping it releases HREADY in
             // ST_IDLE, returning stale HRDATA without issuing AR.
             //
-            // Do NOT apply this to HB_SINGLE: the directed single-read/error
-            // tests can still be presenting the original SINGLE NONSEQ while
-            // the fence retires, and replaying that beat deadlocks them.
+            // For SINGLE reads, avoid replaying the original held NONSEQ: the
+            // directed single-read/error tests can still be presenting that
+            // original address while the fence retires.  A different address or
+            // size is a true follow-on SINGLE and must be latched too.
             if (!pnd_valid &&
                 HSEL && HREADYIN && (HTRANS == TRN_NONSEQ) &&
-                !HWRITE && (HBURST != HB_SINGLE)) begin
+                !HWRITE &&
+                ((HBURST != HB_SINGLE) || (HADDR != ap_addr) || (HSIZE != ap_size))) begin
               pnd_valid <= 1'b1;
               pnd_addr  <= HADDR;
               pnd_size  <= HSIZE;
