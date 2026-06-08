@@ -3,8 +3,11 @@
 AHB-lite to AXI4 bridge.
 
 ## Status: 
-- RTL and TB is WIP. RTL is used (and working) with Core-V Wally (ttps://github.com/openhwgroup/cvw) replacing proprietary alternative.
+- RTL and TB is WIP.
+- RTL is used (and working) in simulation and FPGAs with Core-V Wally (https://github.com/openhwgroup/cvw) replacing a proprietary alternative.
 - Cocotb TB is far from being complete
+- Mostly written by AI (not the most readable).
+
 
 # Run tests
 
