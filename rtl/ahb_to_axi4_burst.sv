@@ -1511,13 +1511,12 @@ module ahb_to_axi4_burst #(
             rd_fence_seen_idle  <= 1'b1;
 
           end else begin
-            // v26: final fence-exit catch for new read address phases.
+            // Final fence-exit catch for new address phases.
             //
-            // Long-run traces show a read NONSEQ can arrive on the
-            // exact cycle where ST_RD_FENCE is already clean and about to
-            // exit.  HREADY is still low in this cycle, so the AHB beat has
-            // not completed, but dropping it releases HREADY in
-            // ST_IDLE, returning stale HRDATA without issuing AR.
+            // A NONSEQ can arrive on the exact cycle where ST_RD_FENCE is
+            // already clean and about to exit. HREADYIN can accept that
+            // address even though this slave's local HREADY is still low.
+            // Preserve both reads and writes before entering ST_IDLE.
             //
             // For SINGLE reads, avoid replaying the original held NONSEQ: the
             // directed single-read/error tests can still be presenting that
@@ -1525,17 +1524,17 @@ module ahb_to_axi4_burst #(
             // size is a true follow-on SINGLE and must be latched too.
             if (!pnd_valid &&
                 HSEL && HREADYIN && (HTRANS == TRN_NONSEQ) &&
-                !HWRITE &&
-                ((HBURST != HB_SINGLE) || (HADDR != ap_addr) || (HSIZE != ap_size))) begin
+                (HWRITE ||
+                 (HBURST != HB_SINGLE) || (HADDR != ap_addr) || (HSIZE != ap_size))) begin
               pnd_valid <= 1'b1;
               pnd_addr  <= HADDR;
               pnd_size  <= HSIZE;
               pnd_burst <= HBURST;
-              pnd_write <= 1'b0;
+              pnd_write <= HWRITE;
               pnd_prot  <= HPROT;
               pnd_lock  <= HMASTLOCK;
               pnd_wfirst_valid <= 1'b0;
-              pnd_wfirst_sysphase_q <= 1'b0;
+              pnd_wfirst_sysphase_q <= HWRITE && (HBURST != HB_INCR);
               rd_sameaddr_followon_cand <= 1'b0;
             end
             rd_fence_seen_idle  <= 1'b0;

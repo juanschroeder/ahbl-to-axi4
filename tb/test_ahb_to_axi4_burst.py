@@ -1,6 +1,6 @@
 import cocotb
 from cocotb.clock import Clock
-from cocotb.triggers import ClockCycles, RisingEdge, FallingEdge, ReadOnly, NextTimeStep, Event, with_timeout
+from cocotb.triggers import ClockCycles, RisingEdge, FallingEdge, ReadOnly, NextTimeStep, Timer, Event, with_timeout
 from cocotbext.ahb import AHBBus, AHBLiteMaster
 from cocotbext.axi import AxiBus, AxiRam
 
@@ -8695,6 +8695,18 @@ async def test_many_incr8_cacheline_reads_and_writes_hprot3(dut):
 # OpenSBI-like cache-line INCR8 helpers / test
 # ---------------------------------------------------------------------------
 
+async def _wait_hready_high_preedge(dut):
+    """Model uninterrupted selection: global HREADY follows this slave."""
+    while True:
+        await FallingEdge(dut.clk)
+        hready = int(dut.hready.value)
+        dut.hreadyin.value = hready
+        await RisingEdge(dut.clk)
+        await NextTimeStep()
+        if hready:
+            return
+
+
 async def _ahb_write_incr8_hprot3_manual(dut, start_addr, beats_8):
     """Drive one AHB INCR8 64-bit write burst with HPROT=0x3."""
     assert len(beats_8) == 8
@@ -8713,7 +8725,7 @@ async def _ahb_write_incr8_hprot3_manual(dut, start_addr, beats_8):
     dut.hwdata.value = 0
 
     for i in range(8):
-        await _wait_hready_high(dut)
+        await _wait_hready_high_preedge(dut)
 
         if i == 7:
             dut.haddr.value = 0
@@ -8733,7 +8745,7 @@ async def _ahb_write_incr8_hprot3_manual(dut, start_addr, beats_8):
         addr_i = start_addr + i * 8
         dut.hwdata.value = (beats_8[i] & _mask_nbytes(8)) << _lane_shift(addr_i)
 
-    await _wait_hready_high(dut)
+    await _wait_hready_high_preedge(dut)
     _init_direct_ahb_signals(dut)
     dut.hsel.value = 1
     dut.hreadyin.value = 1
@@ -8756,7 +8768,7 @@ async def _ahb_read_incr8_hprot3_manual(dut, start_addr):
     dut.hwdata.value = 0
 
     for i in range(8):
-        await _wait_hready_high(dut)
+        await _wait_hready_high_preedge(dut)
 
         if i > 0:
             results.append(int(dut.hrdata.value))
@@ -8776,7 +8788,7 @@ async def _ahb_read_incr8_hprot3_manual(dut, start_addr):
             dut.hwrite.value = 0
             dut.hprot.value = hprot
 
-    await _wait_hready_high(dut)
+    await _wait_hready_high_preedge(dut)
     results.append(int(dut.hrdata.value))
 
     _init_direct_ahb_signals(dut)
@@ -15244,3 +15256,580 @@ async def test_regression_v26_single_read_final_fence_must_be_latched(dut):
         "bridge latched the final-fence SINGLE read but did not dispatch AR; "
         f"state={int(dut.dut.state.value)} pnd_valid={int(dut.dut.pnd_valid.value)}"
     )
+
+
+@cocotb.test()
+async def test_regression_final_read_fence_single_write_must_be_latched(dut):
+    set_test_id(dut)
+    await setup_dut_no_axi_slave(dut)
+
+    read_addr = 0x8400_3000
+    write_addr = 0x8400_2004
+    write_value = 0x8400_3120
+    write_data = write_value << 32
+    write_size = 2
+
+    # Complete one SINGLE read and let the bridge enter its two-cycle read
+    # fence with no pending transfer.
+    await FallingEdge(dut.clk)
+    dut.hsel.value = 1
+    dut.hreadyin.value = 1
+    dut.haddr.value = read_addr
+    dut.hburst.value = AHB_BURST_SINGLE
+    dut.hmastlock.value = 0
+    dut.hprot.value = 0
+    dut.hsize.value = AHB_SIZE_8
+    dut.htrans.value = AHB_NONSEQ
+    dut.hwrite.value = 0
+    dut.hwdata.value = 0
+
+    await RisingEdge(dut.clk)
+    await NextTimeStep()
+    dut.hsel.value = 0
+    dut.htrans.value = AHB_IDLE
+    dut.haddr.value = 0
+
+    while not int(dut.m_axi_arvalid.value):
+        await RisingEdge(dut.clk)
+    dut.m_axi_arready.value = 1
+    await RisingEdge(dut.clk)
+    await NextTimeStep()
+    dut.m_axi_arready.value = 0
+
+    dut.m_axi_rdata.value = 0x0208_0000_0000_0000
+    dut.m_axi_rresp.value = 0
+    dut.m_axi_rlast.value = 1
+    dut.m_axi_rvalid.value = 1
+
+    for _ in range(32):
+        await ReadOnly()
+        if int(dut.hready.value):
+            break
+        await RisingEdge(dut.clk)
+    else:
+        raise AssertionError("setup: SINGLE read did not complete")
+
+    await RisingEdge(dut.clk)
+    await NextTimeStep()
+    dut.m_axi_rvalid.value = 0
+    dut.m_axi_rlast.value = 0
+    dut.hsel.value = 0
+    dut.hreadyin.value = 1
+    dut.haddr.value = 0
+    dut.hburst.value = AHB_BURST_SINGLE
+    dut.hsize.value = AHB_SIZE_8
+    dut.htrans.value = AHB_IDLE
+    dut.hwrite.value = 0
+    dut.hwdata.value = 0
+
+    for _ in range(64):
+        await RisingEdge(dut.clk)
+        await ReadOnly()
+        if (
+            int(dut.dut.state.value) == 16 and
+            int(dut.dut.rd_fence_seen_idle.value) == 1 and
+            int(dut.hready.value) == 0 and
+            not int(dut.dut.pnd_valid.value)
+        ):
+            break
+        await NextTimeStep()
+    else:
+        raise AssertionError("setup: final ST_RD_FENCE exit point not reached")
+
+    await NextTimeStep()
+
+    # The previous system transfer is ready, so HREADYIN accepts this address
+    # phase even though this bridge's local HREADYOUT is low.
+    dut.hsel.value = 1
+    dut.hreadyin.value = 1
+    dut.haddr.value = write_addr
+    dut.hburst.value = AHB_BURST_SINGLE
+    dut.hsize.value = write_size
+    dut.htrans.value = AHB_NONSEQ
+    dut.hwrite.value = 1
+    dut.hwdata.value = 0
+
+    await RisingEdge(dut.clk)
+    await ReadOnly()
+
+    assert int(dut.dut.pnd_valid.value) == 1, (
+        "final ST_RD_FENCE exit dropped an accepted SINGLE write address: "
+        f"state={int(dut.dut.state.value)} "
+        f"HREADY={int(dut.hready.value)} HREADYIN={int(dut.hreadyin.value)}"
+    )
+    assert int(dut.dut.pnd_write.value) == 1
+    assert int(dut.dut.pnd_addr.value) == write_addr
+
+    await NextTimeStep()
+    dut.hsel.value = 0
+    dut.hreadyin.value = 0
+    dut.haddr.value = 0
+    dut.htrans.value = AHB_IDLE
+    dut.hwrite.value = 0
+    dut.hwdata.value = write_data
+
+    await RisingEdge(dut.clk)
+    await ReadOnly()
+    assert int(dut.dut.pnd_wfirst_valid.value) == 1, (
+        "accepted final-fence SINGLE write lost its following AHB data phase"
+    )
+    assert int(dut.dut.pnd_wfirst_data.value) == write_data
+
+    await NextTimeStep()
+    dut.hreadyin.value = 0
+
+    for _ in range(32):
+        await ReadOnly()
+        if int(dut.m_axi_awvalid.value):
+            aw = (
+                int(dut.m_axi_awaddr.value),
+                int(dut.m_axi_awlen.value),
+                int(dut.m_axi_awsize.value),
+            )
+            break
+        await RisingEdge(dut.clk)
+        await NextTimeStep()
+    else:
+        raise AssertionError("latched final-fence write did not emit AXI AW")
+
+    assert aw == (write_addr, 0, write_size)
+
+    await NextTimeStep()
+    dut.m_axi_awready.value = 1
+    await RisingEdge(dut.clk)
+    await NextTimeStep()
+    dut.m_axi_awready.value = 0
+
+    for _ in range(32):
+        await ReadOnly()
+        if int(dut.m_axi_wvalid.value):
+            w = (
+                int(dut.m_axi_wdata.value),
+                int(dut.m_axi_wstrb.value),
+                int(dut.m_axi_wlast.value),
+            )
+            break
+        await RisingEdge(dut.clk)
+        await NextTimeStep()
+    else:
+        raise AssertionError("latched final-fence write did not emit AXI W")
+
+    assert w == (write_data, 0xF0, 1)
+
+    await NextTimeStep()
+    dut.m_axi_wready.value = 1
+    await RisingEdge(dut.clk)
+    await NextTimeStep()
+    dut.m_axi_wready.value = 0
+    dut.m_axi_bresp.value = 0
+    dut.m_axi_bvalid.value = 1
+    for _ in range(16):
+        await ReadOnly()
+        if int(dut.m_axi_bready.value):
+            break
+        await RisingEdge(dut.clk)
+        await NextTimeStep()
+    else:
+        raise AssertionError("latched final-fence write did not accept AXI B")
+
+    await RisingEdge(dut.clk)
+
+
+@cocotb.test()
+async def test_usb_clf_read_write_read_no_idle_gap(dut):
+    """
+    Reproduce the CPU-side sequence used by the OHCI CLF re-kick:
+
+      read32  HcControlCurrentED
+      write32 HcCommandStatus = OHCI_CLF
+      read32  HcCommandStatus
+
+    Each next address phase overlaps the previous transfer's data phase.
+    """
+    set_test_id(dut)
+
+    CURRENT_ADDR = 0x100C0024
+    CMD_ADDR = 0x100C0008
+    OHCI_CLF = 0x00000002
+    SIZE_WORD = 2
+
+    await setup_dut_no_axi_slave(dut)
+    write_stage = {"name": "waiting for AWVALID"}
+
+    async def service_two_reads():
+        reads = []
+        for index, value in enumerate((0x00000000, OHCI_CLF)):
+            while not int(dut.m_axi_arvalid.value):
+                await RisingEdge(dut.clk)
+
+            await ClockCycles(dut.clk, 1 + index)
+            dut.m_axi_arready.value = 1
+            while True:
+                await RisingEdge(dut.clk)
+                if int(dut.m_axi_arvalid.value) and int(dut.m_axi_arready.value):
+                    reads.append((
+                        int(dut.m_axi_araddr.value),
+                        int(dut.m_axi_arsize.value),
+                    ))
+                    break
+            dut.m_axi_arready.value = 0
+
+            await ClockCycles(dut.clk, 2 + index)
+            dut.m_axi_rdata.value = value
+            dut.m_axi_rresp.value = 0
+            dut.m_axi_rlast.value = 1
+            dut.m_axi_rvalid.value = 1
+            while True:
+                await RisingEdge(dut.clk)
+                if int(dut.m_axi_rvalid.value) and int(dut.m_axi_rready.value):
+                    break
+            dut.m_axi_rvalid.value = 0
+            dut.m_axi_rlast.value = 0
+
+        return reads
+
+    async def service_clf_write():
+        while not int(dut.m_axi_awvalid.value):
+            await RisingEdge(dut.clk)
+
+        write_stage["name"] = "delaying AWREADY"
+        await ClockCycles(dut.clk, 2)
+        dut.m_axi_awready.value = 1
+        while True:
+            await RisingEdge(dut.clk)
+            if int(dut.m_axi_awvalid.value) and int(dut.m_axi_awready.value):
+                aw = (
+                    int(dut.m_axi_awaddr.value),
+                    int(dut.m_axi_awlen.value),
+                    int(dut.m_axi_awsize.value),
+                )
+                break
+        dut.m_axi_awready.value = 0
+
+        write_stage["name"] = "waiting for WVALID"
+        while not int(dut.m_axi_wvalid.value):
+            await RisingEdge(dut.clk)
+
+        write_stage["name"] = "delaying WREADY"
+        await ClockCycles(dut.clk, 3)
+        dut.m_axi_wready.value = 1
+        while True:
+            await RisingEdge(dut.clk)
+            if int(dut.m_axi_wvalid.value) and int(dut.m_axi_wready.value):
+                w = (
+                    int(dut.m_axi_wdata.value),
+                    int(dut.m_axi_wstrb.value),
+                    int(dut.m_axi_wlast.value),
+                )
+                break
+        dut.m_axi_wready.value = 0
+
+        write_stage["name"] = "delaying BVALID"
+        await ClockCycles(dut.clk, 4)
+        dut.m_axi_bresp.value = 0
+        dut.m_axi_bvalid.value = 1
+        while True:
+            await RisingEdge(dut.clk)
+            if int(dut.m_axi_bvalid.value) and int(dut.m_axi_bready.value):
+                break
+        dut.m_axi_bvalid.value = 0
+        write_stage["name"] = "complete"
+
+        return aw, w
+
+    reads_task = cocotb.start_soon(service_two_reads())
+    write_task = cocotb.start_soon(service_clf_write())
+
+    dut.haddr.value = CURRENT_ADDR
+    dut.hburst.value = AHB_BURST_SINGLE
+    dut.hsize.value = SIZE_WORD
+    dut.htrans.value = AHB_NONSEQ
+    dut.hwrite.value = 0
+    dut.hwdata.value = 0
+
+    await RisingEdge(dut.clk)
+    await NextTimeStep()
+
+    # Hold CLF's address phase while the first read is waiting for AXI R.
+    dut.haddr.value = CMD_ADDR
+    dut.hburst.value = AHB_BURST_SINGLE
+    dut.hsize.value = SIZE_WORD
+    dut.htrans.value = AHB_NONSEQ
+    dut.hwrite.value = 1
+
+    for _ in range(200):
+        await RisingEdge(dut.clk)
+        await ReadOnly()
+        if int(dut.hready.value):
+            break
+    else:
+        raise AssertionError("USB CLF sequence: first read never completed")
+
+    # HREADY is combinational for the cycle that just started. Hold the write
+    # address through the following edge, where AHB actually accepts it.
+    await RisingEdge(dut.clk)
+    await ReadOnly()
+
+    assert int(dut.dut.pnd_valid.value) == 1, (
+        "USB CLF sequence: final read beat did not latch the overlapping write "
+        f"(state={int(dut.dut.state.value)} "
+        f"live_interleave={int(dut.dut.rd_live_interleave.value)})"
+    )
+    assert int(dut.dut.pnd_write.value) == 1
+    assert int(dut.dut.pnd_addr.value) == CMD_ADDR
+
+    await NextTimeStep()
+
+    # CLF data phase overlaps the following command-status read address phase.
+    dut.haddr.value = CMD_ADDR
+    dut.hburst.value = AHB_BURST_SINGLE
+    dut.hsize.value = SIZE_WORD
+    dut.htrans.value = AHB_NONSEQ
+    dut.hwrite.value = 0
+    dut.hwdata.value = OHCI_CLF
+
+    await RisingEdge(dut.clk)
+    await ReadOnly()
+    assert int(dut.dut.pnd_valid.value) == 1
+    assert int(dut.dut.pnd_write.value) == 1
+    assert int(dut.dut.pnd_wfirst_valid.value) == 1, (
+        "USB CLF sequence: pending write address was latched, but its data phase "
+        f"was not captured (state={int(dut.dut.state.value)} "
+        f"ahb_wphase_valid={int(dut.dut.ahb_wphase_valid.value)} "
+        f"ahb_waddr_d=0x{int(dut.dut.ahb_waddr_d.value):08x})"
+    )
+
+    for _ in range(300):
+        await RisingEdge(dut.clk)
+        await ReadOnly()
+        if int(dut.hready.value):
+            break
+    else:
+        raise AssertionError("USB CLF sequence: write/read handoff never completed")
+
+    # Hold the following read address through its accepting HREADY edge.
+    await RisingEdge(dut.clk)
+    await NextTimeStep()
+    _init_direct_ahb_signals(dut)
+
+    for _ in range(300):
+        await RisingEdge(dut.clk)
+        await ReadOnly()
+        if int(dut.hready.value):
+            final_read = int(dut.hrdata.value) & 0xFFFFFFFF
+            break
+    else:
+        raise AssertionError("USB CLF sequence: final read never completed")
+
+    reads = await with_timeout(reads_task, 20, "us")
+    try:
+        aw, w = await with_timeout(write_task, 20, "us")
+    except Exception:
+        raise AssertionError(
+            "USB CLF AXI write did not complete: "
+            f"stage={write_stage['name']} state={int(dut.dut.state.value)} "
+            f"pnd_valid={int(dut.dut.pnd_valid.value)} "
+            f"pnd_write={int(dut.dut.pnd_write.value)} "
+            f"pnd_wfirst_valid={int(dut.dut.pnd_wfirst_valid.value)} "
+            f"AWVALID={int(dut.m_axi_awvalid.value)} "
+            f"WVALID={int(dut.m_axi_wvalid.value)} "
+            f"BREADY={int(dut.m_axi_bready.value)}"
+        )
+
+    assert reads == [(CURRENT_ADDR, SIZE_WORD), (CMD_ADDR, SIZE_WORD)], (
+        f"USB CLF sequence emitted wrong AXI reads: {reads!r}"
+    )
+    assert aw == (CMD_ADDR, 0, SIZE_WORD), (
+        f"USB CLF AW mismatch: got {aw!r}"
+    )
+    assert w == (OHCI_CLF, 0x0F, 1), (
+        f"USB CLF W mismatch: data=0x{w[0]:016x} strb=0x{w[1]:02x} last={w[2]}"
+    )
+    assert final_read == OHCI_CLF, (
+        f"USB CLF readback mismatch: got 0x{final_read:08x}"
+    )
+
+
+@cocotb.test()
+async def test_usb_ohci_descriptor_store_stream_then_clf(dut):
+    """
+    Reproduce the CPU write pattern used to publish an OHCI control list:
+
+      - 32-bit stores to the four hardware words of several TDs
+      - a 32-bit store to ED TailP
+      - a 32-bit MMIO store setting HcCommandStatus.CLF
+
+    The AHB transfers are back-to-back SINGLE writes with no inserted IDLE
+    cycles. HREADYIN follows the bridge's HREADY, matching the all-external-
+    slave portion of the SoC path. AXI AW, W, and B channels are independently
+    delayed to force the bridge through its pending fixed-write path.
+    """
+    set_test_id(dut)
+
+    SIZE_WORD = 2
+    TD_BASES = (0x840030C0, 0x84003060, 0x84003000)
+    ED_TAILP = 0x84002004
+    OHCI_CMD_STATUS = 0x100C0008
+    OHCI_CLF = 0x00000002
+
+    writes = []
+    for td_index, td_base in enumerate(TD_BASES):
+        writes.extend((
+            (td_base + 0x0, 0x02080000 | td_index),
+            (td_base + 0x4, 0x84004000 + td_index * 0x20),
+            (td_base + 0x8, TD_BASES[(td_index + 1) % len(TD_BASES)]),
+            (td_base + 0xC, 0x8400401F + td_index * 0x20),
+        ))
+    writes.extend((
+        (ED_TAILP, 0x84003120),
+        (OHCI_CMD_STATUS, OHCI_CLF),
+    ))
+
+    await setup_dut_no_axi_slave(dut)
+
+    async def axi_write_slave():
+        observed = []
+        dut.m_axi_awready.value = 0
+        dut.m_axi_wready.value = 0
+        dut.m_axi_bvalid.value = 0
+        dut.m_axi_bresp.value = 0
+        dut.m_axi_bid.value = 0
+
+        for index in range(len(writes)):
+            while not int(dut.m_axi_awvalid.value):
+                await RisingEdge(dut.clk)
+            await ClockCycles(dut.clk, index % 3)
+            dut.m_axi_awready.value = 1
+            while True:
+                await RisingEdge(dut.clk)
+                if int(dut.m_axi_awvalid.value) and int(dut.m_axi_awready.value):
+                    aw = (
+                        int(dut.m_axi_awaddr.value),
+                        int(dut.m_axi_awlen.value),
+                        int(dut.m_axi_awsize.value),
+                        int(dut.m_axi_awburst.value),
+                    )
+                    break
+            dut.m_axi_awready.value = 0
+
+            while not int(dut.m_axi_wvalid.value):
+                await RisingEdge(dut.clk)
+            await ClockCycles(dut.clk, (index + 1) % 4)
+            dut.m_axi_wready.value = 1
+            while True:
+                await RisingEdge(dut.clk)
+                if int(dut.m_axi_wvalid.value) and int(dut.m_axi_wready.value):
+                    w = (
+                        int(dut.m_axi_wdata.value),
+                        int(dut.m_axi_wstrb.value),
+                        int(dut.m_axi_wlast.value),
+                    )
+                    break
+            dut.m_axi_wready.value = 0
+
+            await ClockCycles(dut.clk, (index * 2) % 5)
+            dut.m_axi_bvalid.value = 1
+            while True:
+                await RisingEdge(dut.clk)
+                if int(dut.m_axi_bvalid.value) and int(dut.m_axi_bready.value):
+                    break
+            dut.m_axi_bvalid.value = 0
+            observed.append((aw, w))
+
+        return observed
+
+    async def drive_back_to_back_single_writes():
+        address_index = 0
+        data_index = None
+        cycles = 0
+
+        # Start driving between active edges so the first NONSEQ cannot be
+        # sampled by the DUT before the driver begins tracking it.
+        await FallingEdge(dut.clk)
+        dut.hsel.value = 1
+        dut.hprot.value = 0b0011
+        dut.hmastlock.value = 0
+        dut.hburst.value = AHB_BURST_SINGLE
+        dut.hsize.value = SIZE_WORD
+        dut.htrans.value = AHB_NONSEQ
+        dut.hwrite.value = 1
+        dut.haddr.value = writes[0][0]
+        dut.hwdata.value = 0
+        await Timer(1, units="ns")
+
+        while address_index < len(writes) or data_index is not None:
+            # Sample the acceptance condition before the active edge. Sampling
+            # HREADY after the edge is wrong here because the accepted transfer
+            # can change bridge state and lower HREADY in the same timestep.
+            accepted = int(dut.hready.value) and int(dut.hreadyin.value)
+            await RisingEdge(dut.clk)
+            await ReadOnly()
+            await NextTimeStep()
+
+            if accepted:
+                if data_index is not None:
+                    data_index = None
+                if address_index < len(writes):
+                    data_index = address_index
+                    address_index += 1
+
+            if address_index < len(writes):
+                dut.hsel.value = 1
+                dut.htrans.value = AHB_NONSEQ
+                dut.hwrite.value = 1
+                dut.haddr.value = writes[address_index][0]
+                dut.hsize.value = SIZE_WORD
+            else:
+                dut.hsel.value = 1
+                dut.htrans.value = AHB_IDLE
+                dut.hwrite.value = 0
+                dut.haddr.value = 0
+                dut.hsize.value = 0
+
+            if data_index is None:
+                dut.hwdata.value = 0
+            else:
+                data_addr, data_value = writes[data_index]
+                dut.hwdata.value = (
+                    (data_value & 0xFFFFFFFF) << _lane_shift(data_addr)
+                )
+
+            cycles += 1
+            if cycles > 4000:
+                raise AssertionError(
+                    "OHCI store stream did not complete: "
+                    f"address_index={address_index}/{len(writes)} "
+                    f"data_index={data_index} state={int(dut.dut.state.value)} "
+                    f"pnd_valid={int(dut.dut.pnd_valid.value)}"
+                )
+
+            await FallingEdge(dut.clk)
+            # For this uninterrupted external-slave stream, the SoC's global
+            # HREADY mux feeds this bridge's HREADYEXT back as HREADYIN.
+            dut.hreadyin.value = int(dut.hready.value)
+            await Timer(1, units="ns")
+
+        _init_direct_ahb_signals(dut)
+
+    slave_task = cocotb.start_soon(axi_write_slave())
+    await with_timeout(drive_back_to_back_single_writes(), 100, "us")
+    observed = await with_timeout(slave_task, 100, "us")
+
+    assert len(observed) == len(writes)
+    for index, ((expected_addr, expected_value), (aw, w)) in enumerate(
+        zip(writes, observed)
+    ):
+        expected_shift = _lane_shift(expected_addr)
+        expected_data = (expected_value & 0xFFFFFFFF) << expected_shift
+        expected_strb = 0x0F << (expected_addr & 0x7)
+
+        assert aw == (expected_addr, 0, SIZE_WORD, 1), (
+            f"OHCI store {index} AW mismatch: got {aw!r}, "
+            f"expected addr=0x{expected_addr:08x} len=0 size=2 burst=INCR"
+        )
+        assert w == (expected_data, expected_strb, 1), (
+            f"OHCI store {index} W mismatch at 0x{expected_addr:08x}: "
+            f"got data=0x{w[0]:016x} strb=0x{w[1]:02x} last={w[2]}, "
+            f"expected data=0x{expected_data:016x} "
+            f"strb=0x{expected_strb:02x} last=1"
+        )
