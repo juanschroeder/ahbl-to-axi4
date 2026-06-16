@@ -995,7 +995,8 @@ class Analyzer {
     }
 
     void apply_shadow_write(std::uint64_t addr, std::uint64_t data, std::uint8_t strb) {
-        for (unsigned i = 0; i < 8; ++i) {
+        const unsigned bytes = data_bus_bytes();
+        for (unsigned i = 0; i < bytes; ++i) {
             if ((strb >> i) & 0x1U) {
                 shadow_memory_[addr + i] = static_cast<std::uint8_t>((data >> (8U * i)) & 0xffU);
             }
@@ -1004,7 +1005,8 @@ class Analyzer {
 
     void check_shadow_read(const char* side, std::uint64_t time, std::uint64_t addr, std::uint64_t data) {
         std::uint64_t expected = 0;
-        for (unsigned i = 0; i < 8; ++i) {
+        const unsigned bytes = data_bus_bytes();
+        for (unsigned i = 0; i < bytes; ++i) {
             const auto it = shadow_memory_.find(addr + i);
             if (it == shadow_memory_.end()) {
                 return;
@@ -1018,6 +1020,14 @@ class Analyzer {
                             " expected=" + format_hex(expected, 64) +
                             " actual=" + format_hex(data, 64));
         }
+    }
+
+    unsigned data_bus_bytes() const {
+        const auto width = bindings_[index_of(SignalKey::WData)].width;
+        if (width <= 0) {
+            return 8;
+        }
+        return static_cast<unsigned>((width + 7) / 8);
     }
 
     Options options_;
@@ -1060,6 +1070,14 @@ class VcdProcessor {
     static bool ends_with(const std::string& s, const std::string& suffix) {
         return s.size() >= suffix.size() &&
                s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+    }
+
+    static std::string base_ref_name(std::string name) {
+        const auto range_pos = name.rfind(" [");
+        if (range_pos != std::string::npos && !name.empty() && name.back() == ']') {
+            name.resize(range_pos);
+        }
+        return name;
     }
 
     void parse_header() {
@@ -1188,14 +1206,16 @@ class VcdProcessor {
     }
 
     static int signal_match_score(const std::string& full_name, const std::string& suffix) {
-        if (full_name == suffix) {
+        const std::string name = base_ref_name(full_name);
+        const std::string wanted = base_ref_name(suffix);
+        if (name == wanted) {
             return 3;
         }
-        const std::string top_level = "testbench_bridge." + suffix;
-        if (full_name == top_level) {
+        const std::string top_level = "testbench_bridge." + wanted;
+        if (name == top_level) {
             return 4;
         }
-        if (ends_with(full_name, "." + suffix)) {
+        if (ends_with(name, "." + wanted)) {
             return 2;
         }
         return 0;
