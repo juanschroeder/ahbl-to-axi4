@@ -26,11 +26,19 @@ enum class InputFormat {
     Auto,
     Vcd,
     Fst,
+    Ila,
+};
+
+enum class SampleMode {
+    Auto,
+    Clock,
+    Timestamp,
 };
 
 struct Options {
     std::string input_path;
     InputFormat format = InputFormat::Auto;
+    SampleMode sample_mode = SampleMode::Auto;
     std::size_t max_mismatches = 50;
     std::size_t progress_interval = 10000;
     bool shadow_memory = true;
@@ -253,6 +261,24 @@ std::vector<std::string> split_ws(const std::string& line) {
     return out;
 }
 
+std::vector<std::string> split_csv_line(const std::string& line) {
+    std::vector<std::string> out;
+    std::string field;
+    bool quoted = false;
+    for (char c : line) {
+        if (c == '"') {
+            quoted = !quoted;
+        } else if (c == ',' && !quoted) {
+            out.push_back(trim(field));
+            field.clear();
+        } else if (c != '\r' && c != '\n') {
+            field.push_back(c);
+        }
+    }
+    out.push_back(trim(field));
+    return out;
+}
+
 std::string shell_escape(const std::string& s) {
     std::string out = "'";
     for (char c : s) {
@@ -273,6 +299,10 @@ InputFormat deduce_format(const Options& options) {
     if (options.input_path.size() >= 4 &&
         options.input_path.substr(options.input_path.size() - 4) == ".fst") {
         return InputFormat::Fst;
+    }
+    if (options.input_path.size() >= 4 &&
+        options.input_path.substr(options.input_path.size() - 4) == ".ila") {
+        return InputFormat::Ila;
     }
     return InputFormat::Vcd;
 }
@@ -317,7 +347,8 @@ class FileLineReader final : public LineReader {
 
 class PipeLineReader final : public LineReader {
   public:
-    explicit PipeLineReader(const std::string& command) : command_(command) {
+    PipeLineReader(std::string command, std::string failure_context)
+        : command_(std::move(command)), failure_context_(std::move(failure_context)) {
         fp_ = ::popen(command_.c_str(), "r");
         if (!fp_) {
             throw std::runtime_error("failed to launch pipe command: " + command_);
@@ -352,16 +383,16 @@ class PipeLineReader final : public LineReader {
         const int rc = ::pclose(fp);
         if (throw_on_failure && rc != 0) {
             std::ostringstream oss;
-            oss << "failed to convert FST input with fst2vcd";
+            oss << failure_context_;
             if (WIFEXITED(rc)) {
                 oss << " (exit " << WEXITSTATUS(rc) << ")";
             }
-            oss << ". The FST may be unreadable or incomplete.";
             throw std::runtime_error(oss.str());
         }
     }
 
     std::string command_;
+    std::string failure_context_;
     FILE* fp_ = nullptr;
 };
 
@@ -1080,6 +1111,22 @@ class VcdProcessor {
         return name;
     }
 
+    static std::string strip_vivado_duplicate_suffix(std::string name) {
+        const auto sep = name.find_last_of("./");
+        const auto base_start = sep == std::string::npos ? 0 : sep + 1;
+        const auto underscore = name.rfind('_');
+        if (underscore == std::string::npos || underscore < base_start || underscore + 1 >= name.size()) {
+            return name;
+        }
+        for (std::size_t i = underscore + 1; i < name.size(); ++i) {
+            if (name[i] < '0' || name[i] > '9') {
+                return name;
+            }
+        }
+        name.resize(underscore);
+        return name;
+    }
+
     void parse_header() {
         std::vector<std::string> scope_stack;
         std::string line;
@@ -1168,7 +1215,13 @@ class VcdProcessor {
             }
         }
 
-        require_binding(SignalKey::Clk);
+        if (options_.sample_mode == SampleMode::Clock) {
+            require_binding(SignalKey::Clk);
+        }
+        sample_on_timestamps_ =
+            options_.sample_mode == SampleMode::Timestamp ||
+            (options_.sample_mode == SampleMode::Auto &&
+             !bindings_[static_cast<std::size_t>(SignalKey::Clk)].bound);
         require_binding(SignalKey::HSelExt);
         require_binding(SignalKey::HAddr);
         require_binding(SignalKey::HWData);
@@ -1206,7 +1259,7 @@ class VcdProcessor {
     }
 
     static int signal_match_score(const std::string& full_name, const std::string& suffix) {
-        const std::string name = base_ref_name(full_name);
+        const std::string name = strip_vivado_duplicate_suffix(base_ref_name(full_name));
         const std::string wanted = base_ref_name(suffix);
         if (name == wanted) {
             return 3;
@@ -1217,6 +1270,12 @@ class VcdProcessor {
         }
         if (ends_with(name, "." + wanted)) {
             return 2;
+        }
+        if (ends_with(name, "/" + wanted)) {
+            return 2;
+        }
+        if (ends_with(name, wanted)) {
+            return 1;
         }
         return 0;
     }
@@ -1279,6 +1338,14 @@ class VcdProcessor {
         if (!have_timestamp_) {
             return;
         }
+        if (sample_on_timestamps_) {
+            if (seen_value_change_at_timestamp_) {
+                analyzer_.on_posedge(current_time_, state_);
+            }
+            prev_state_ = state_;
+            seen_value_change_at_timestamp_ = false;
+            return;
+        }
         const auto clk_before = prev_state_[static_cast<std::size_t>(SignalKey::Clk)];
         const auto clk_after = state_[static_cast<std::size_t>(SignalKey::Clk)];
         if (clk_before.known && clk_after.known && clk_before.value == 0 && clk_after.value == 1) {
@@ -1306,6 +1373,7 @@ class VcdProcessor {
                     auto parsed = parse_vector_change(tokens[0].substr(1));
                     if (parsed) {
                         apply_change(tokens[1], *parsed);
+                        seen_value_change_at_timestamp_ = true;
                     }
                 }
                 continue;
@@ -1315,6 +1383,7 @@ class VcdProcessor {
                 auto parsed = parse_scalar_change(stripped[0]);
                 if (parsed) {
                     apply_change(stripped.substr(1), *parsed);
+                    seen_value_change_at_timestamp_ = true;
                 }
             }
         }
@@ -1342,13 +1411,243 @@ class VcdProcessor {
     std::array<SignalValue, kSignalCount> prev_state_{};
     std::uint64_t current_time_ = 0;
     bool have_timestamp_ = false;
+    bool sample_on_timestamps_ = false;
+    bool seen_value_change_at_timestamp_ = false;
+};
+
+class IlaCsvProcessor {
+  public:
+    IlaCsvProcessor(LineReader& reader, const Options& options)
+        : reader_(reader), options_(options), analyzer_(options) {
+        key_to_column_.fill(-1);
+    }
+
+    void run() {
+        parse_header();
+        parse_radix_row();
+        if (options_.verbose) {
+            dump_bindings();
+        }
+        parse_samples();
+        analyzer_.print_summary();
+    }
+
+  private:
+    static bool ends_with(const std::string& s, const std::string& suffix) {
+        return s.size() >= suffix.size() &&
+               s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+    }
+
+    static std::string base_ref_name(std::string name) {
+        const auto bracket = name.find('[');
+        if (bracket != std::string::npos) {
+            std::size_t end = bracket;
+            while (end > 0 && name[end - 1] == ' ') {
+                end--;
+            }
+            name.resize(end);
+        }
+        return name;
+    }
+
+    static std::string strip_vivado_duplicate_suffix(std::string name) {
+        const auto sep = name.find_last_of("./");
+        const auto base_start = sep == std::string::npos ? 0 : sep + 1;
+        const auto underscore = name.rfind('_');
+        if (underscore == std::string::npos || underscore < base_start || underscore + 1 >= name.size()) {
+            return name;
+        }
+        for (std::size_t i = underscore + 1; i < name.size(); ++i) {
+            if (name[i] < '0' || name[i] > '9') {
+                return name;
+            }
+        }
+        name.resize(underscore);
+        return name;
+    }
+
+    static int width_from_name(const std::string& name) {
+        const auto lb = name.find('[');
+        const auto colon = name.find(':', lb == std::string::npos ? 0 : lb);
+        const auto rb = name.find(']', colon == std::string::npos ? 0 : colon);
+        if (lb == std::string::npos || colon == std::string::npos || rb == std::string::npos) {
+            return 1;
+        }
+        const int msb = std::stoi(name.substr(lb + 1, colon - lb - 1));
+        const int lsb = std::stoi(name.substr(colon + 1, rb - colon - 1));
+        return std::abs(msb - lsb) + 1;
+    }
+
+    static int signal_match_score(const std::string& full_name, const std::string& suffix) {
+        const std::string name = strip_vivado_duplicate_suffix(base_ref_name(full_name));
+        const std::string wanted = base_ref_name(suffix);
+        if (name == wanted) {
+            return 3;
+        }
+        const std::string top_level = "testbench_bridge." + wanted;
+        if (name == top_level) {
+            return 4;
+        }
+        if (ends_with(name, "." + wanted) || ends_with(name, "/" + wanted)) {
+            return 2;
+        }
+        if (ends_with(name, wanted)) {
+            return 1;
+        }
+        return 0;
+    }
+
+    static SignalValue parse_csv_value(std::string text) {
+        SignalValue out;
+        text = trim(text);
+        out.bits = text;
+        if (text.empty() || text.find_first_of("xXzZ") != std::string::npos) {
+            out.known = false;
+            return out;
+        }
+        if (text.rfind("0x", 0) == 0 || text.rfind("0X", 0) == 0) {
+            text.erase(0, 2);
+        }
+        out.known = true;
+        out.value = std::strtoull(text.c_str(), nullptr, 16);
+        return out;
+    }
+
+    void parse_header() {
+        std::string line;
+        if (!reader_.getline(line)) {
+            throw std::runtime_error("empty ILA CSV input");
+        }
+        headers_ = split_csv_line(line);
+        resolve_signals();
+    }
+
+    void parse_radix_row() {
+        std::string line;
+        if (!reader_.getline(line)) {
+            throw std::runtime_error("ILA CSV input missing radix row");
+        }
+    }
+
+    void resolve_signals() {
+        for (const auto& spec : kSignalSpecs) {
+            int best_index = -1;
+            int best_score = -1;
+            for (std::size_t i = 0; i < headers_.size(); ++i) {
+                const int score = signal_match_score(headers_[i], spec.suffix);
+                if (score > best_score) {
+                    best_index = static_cast<int>(i);
+                    best_score = score;
+                } else if (score == best_score && best_index >= 0 &&
+                           headers_[i].size() < headers_[static_cast<std::size_t>(best_index)].size()) {
+                    best_index = static_cast<int>(i);
+                }
+            }
+
+            if (best_index >= 0 && best_score > 0) {
+                SignalBinding binding;
+                binding.code = std::to_string(best_index);
+                binding.full_name = headers_[static_cast<std::size_t>(best_index)];
+                binding.width = width_from_name(binding.full_name);
+                binding.bound = true;
+                bindings_[static_cast<std::size_t>(spec.key)] = binding;
+                key_to_column_[static_cast<std::size_t>(spec.key)] = best_index;
+                analyzer_.bind_signal(spec.key, binding);
+            }
+        }
+
+        require_binding(SignalKey::HSelExt);
+        require_binding(SignalKey::HAddr);
+        require_binding(SignalKey::HWData);
+        require_binding(SignalKey::HWStrb);
+        require_binding(SignalKey::HWrite);
+        require_binding(SignalKey::HSize);
+        require_binding(SignalKey::HBurst);
+        require_binding(SignalKey::HTrans);
+        require_binding(SignalKey::HReady);
+        require_binding(SignalKey::HReadyExt);
+        require_binding(SignalKey::HRDataExt);
+        require_binding(SignalKey::AwAddr);
+        require_binding(SignalKey::AwLen);
+        require_binding(SignalKey::AwSize);
+        require_binding(SignalKey::AwBurst);
+        require_binding(SignalKey::AwValid);
+        require_binding(SignalKey::AwReady);
+        require_binding(SignalKey::WData);
+        require_binding(SignalKey::WStrb);
+        require_binding(SignalKey::WLast);
+        require_binding(SignalKey::WValid);
+        require_binding(SignalKey::WReady);
+        require_binding(SignalKey::BValid);
+        require_binding(SignalKey::BReady);
+        require_binding(SignalKey::ArAddr);
+        require_binding(SignalKey::ArLen);
+        require_binding(SignalKey::ArSize);
+        require_binding(SignalKey::ArBurst);
+        require_binding(SignalKey::ArValid);
+        require_binding(SignalKey::ArReady);
+        require_binding(SignalKey::RData);
+        require_binding(SignalKey::RLast);
+        require_binding(SignalKey::RValid);
+        require_binding(SignalKey::RReady);
+    }
+
+    void require_binding(SignalKey key) const {
+        const auto& binding = bindings_[static_cast<std::size_t>(key)];
+        if (!binding.bound) {
+            const auto& spec = kSignalSpecs[static_cast<std::size_t>(key)];
+            throw std::runtime_error("missing required signal in ILA CSV trace: " + std::string(spec.suffix));
+        }
+    }
+
+    void parse_samples() {
+        std::string line;
+        std::uint64_t fallback_time = 0;
+        while (reader_.getline(line)) {
+            const auto cols = split_csv_line(line);
+            if (cols.empty()) {
+                continue;
+            }
+            for (std::size_t key_idx = 0; key_idx < key_to_column_.size(); ++key_idx) {
+                const int col = key_to_column_[key_idx];
+                if (col >= 0 && static_cast<std::size_t>(col) < cols.size()) {
+                    state_[key_idx] = parse_csv_value(cols[static_cast<std::size_t>(col)]);
+                }
+            }
+            const std::uint64_t time = cols[0].empty()
+                ? fallback_time
+                : std::strtoull(cols[0].c_str(), nullptr, 10);
+            analyzer_.on_posedge(time, state_);
+            fallback_time++;
+        }
+    }
+
+    void dump_bindings() const {
+        std::cout << "Resolved ILA CSV signal bindings:\n";
+        for (const auto& spec : kSignalSpecs) {
+            const auto& binding = bindings_[static_cast<std::size_t>(spec.key)];
+            if (binding.bound) {
+                std::cout << "  " << spec.pretty_name << " -> " << binding.full_name
+                          << " (column " << binding.code << ")\n";
+            }
+        }
+    }
+
+    LineReader& reader_;
+    Options options_;
+    Analyzer analyzer_;
+    std::vector<std::string> headers_;
+    std::array<SignalBinding, kSignalCount> bindings_{};
+    std::array<int, kSignalCount> key_to_column_{};
+    std::array<SignalValue, kSignalCount> state_{};
 };
 
 void print_usage(const char* argv0) {
     std::cerr
-        << "Usage: " << argv0 << " --input <trace.{fst|vcd}> [options]\n"
+        << "Usage: " << argv0 << " --input <trace.{fst|vcd|ila}> [options]\n"
         << "Options:\n"
-        << "  --format <auto|fst|vcd>\n"
+        << "  --format <auto|fst|vcd|ila>\n"
+        << "  --sample-mode <auto|clock|timestamp>\n"
         << "  --max-mismatches <n>\n"
         << "  --progress-interval <n>\n"
         << "  --no-shadow-memory\n"
@@ -1370,8 +1669,21 @@ Options parse_args(int argc, char** argv) {
                 options.format = InputFormat::Fst;
             } else if (fmt == "vcd") {
                 options.format = InputFormat::Vcd;
+            } else if (fmt == "ila") {
+                options.format = InputFormat::Ila;
             } else {
                 throw std::runtime_error("unknown format: " + fmt);
+            }
+        } else if (arg == "--sample-mode" && i + 1 < argc) {
+            const std::string mode = argv[++i];
+            if (mode == "auto") {
+                options.sample_mode = SampleMode::Auto;
+            } else if (mode == "clock") {
+                options.sample_mode = SampleMode::Clock;
+            } else if (mode == "timestamp") {
+                options.sample_mode = SampleMode::Timestamp;
+            } else {
+                throw std::runtime_error("unknown sample mode: " + mode);
             }
         } else if (arg == "--max-mismatches" && i + 1 < argc) {
             options.max_mismatches = std::strtoull(argv[++i], nullptr, 10);
@@ -1399,8 +1711,21 @@ std::unique_ptr<LineReader> open_reader(const Options& options) {
     if (format == InputFormat::Vcd) {
         return std::make_unique<FileLineReader>(options.input_path);
     }
-    const std::string cmd = "fst2vcd " + shell_escape(options.input_path);
-    return std::make_unique<PipeLineReader>(cmd);
+    if (format == InputFormat::Fst) {
+        const std::string cmd = "fst2vcd " + shell_escape(options.input_path);
+        return std::make_unique<PipeLineReader>(
+            cmd,
+            "failed to convert FST input with fst2vcd. The FST may be unreadable or incomplete.");
+    }
+    throw std::runtime_error("internal error: ILA input must use the ILA sample reader");
+}
+
+std::unique_ptr<LineReader> open_ila_csv_reader(const Options& options) {
+    const std::string cmd = "unzip -p " + shell_escape(options.input_path) + " waveform.csv";
+    return std::make_unique<PipeLineReader>(
+        cmd,
+        "failed to extract waveform.csv from ILA input with unzip. "
+        "The ILA file may be unreadable or may not contain waveform.csv.");
 }
 
 }  // namespace
@@ -1408,9 +1733,15 @@ std::unique_ptr<LineReader> open_reader(const Options& options) {
 int main(int argc, char** argv) {
     try {
         const Options options = parse_args(argc, argv);
-        auto reader = open_reader(options);
-        VcdProcessor processor(*reader, options);
-        processor.run();
+        if (deduce_format(options) == InputFormat::Ila) {
+            auto reader = open_ila_csv_reader(options);
+            IlaCsvProcessor processor(*reader, options);
+            processor.run();
+        } else {
+            auto reader = open_reader(options);
+            VcdProcessor processor(*reader, options);
+            processor.run();
+        }
         return 0;
     } catch (const std::exception& ex) {
         std::cerr << "error: " << ex.what() << "\n";
