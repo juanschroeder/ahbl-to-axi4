@@ -164,7 +164,7 @@ module ahb_to_axi4_burst #(
     ST_RD_FENCE             // Drain/flush any late stale R beats before next read transaction   
   } state_t;
 
-  (* mark_debug = "true" *) state_t state;
+  state_t state;
 
   // ?????? Address-phase capture registers ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
   logic [AW-1:0]   ap_addr;
@@ -175,18 +175,18 @@ module ahb_to_axi4_burst #(
   logic            ap_lock;
 
   // ?????? Beat counter (fixed-length write and all read paths) ??????????????????????????????????????????????????????????????????
-  (* mark_debug = "true" *) logic [7:0] beat_cnt;
+  logic [7:0] beat_cnt;
 
   // ?????? AW-sent flag (shared by both write paths) ???????????????????????????????????????????????????????????????????????????????????????????????????
-  (* mark_debug = "true" *) logic aw_sent;
+  logic aw_sent;
 
   // ?????? AR-done flag: prevents consuming stale R beats from a prior transaction ?????????
   // Cleared whenever ST_RD_A is entered, set when ARREADY=1 in ST_RD_A.
   // RREADY and HREADY in ST_RD_D are gated on this flag so that leftover R beats
   // sitting in the CDC FIFO from a previously-abandoned read are not mistaken for
   // the response to the current AR.
-  (* mark_debug = "true" *) logic ar_done;
-  (* mark_debug = "true" *) logic rd_d_entry;  // high for exactly one cycle on entry to ST_RD_D; suppresses RREADY
+  logic ar_done;
+  logic rd_d_entry;  // high for exactly one cycle on entry to ST_RD_D; suppresses RREADY
 
   // wr_resp_entry removed: the ST_WR_D last-beat fast-path already handles
   // the case where BVALID is asserted on the same cycle as WLAST (zero-
@@ -197,15 +197,15 @@ module ahb_to_axi4_burst #(
   // ?????? INCR write accumulation buffer ?????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
   logic [DW-1:0]         ibuf_data [0:MAX_INCR_BEATS-1];
   logic [DW/8-1:0]       ibuf_strb [0:MAX_INCR_BEATS-1];
-  (* mark_debug = "true" *) logic [IBUF_CNT_W-1:0] acc_cnt;
-  (* mark_debug = "true" *) logic [IBUF_IDX_W-1:0] flush_ptr;
+  logic [IBUF_CNT_W-1:0] acc_cnt;
+  logic [IBUF_IDX_W-1:0] flush_ptr;
   logic [AW-1:0]               acc_cnt_aw;
   logic [7:0]                  acc_cnt_u8;
   logic                        fix_flush_full_len;
 
   // ?????? INCR-specific tracking registers ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
-  (* mark_debug = "true" *) logic incr_rd;          // Active INCR read burst (chunked)
-  (* mark_debug = "true" *) logic incr_wr_cont;     // INCR write continues accumulation after flush+resp
+  logic incr_rd;          // Active INCR read burst (chunked)
+  logic incr_wr_cont;     // INCR write continues accumulation after flush+resp
   logic incr_drain;       // Drain is for early INCR termination (not error)
   logic incr_rd_busy;     // Stall R channel during mid-chunk BUSY on AHB side
 
@@ -214,7 +214,7 @@ module ahb_to_axi4_burst #(
   // presents a new NONSEQ in that cycle (or the following IDLE data phase),
   // the address is captured here so it survives until the bridge reaches
   // ST_IDLE after the write completes.
-  (* mark_debug = "true" *) logic        pnd_valid;   // a NONSEQ was latched while INCR write was busy
+  logic        pnd_valid;   // a NONSEQ was latched while INCR write was busy
   logic [AW-1:0] pnd_addr;
   logic [2:0]  pnd_size;
   logic [2:0]  pnd_burst;
@@ -232,7 +232,7 @@ module ahb_to_axi4_burst #(
   logic [DW/8-1:0] ahb_wstrb_d;
   logic [AW-1:0]   ahb_waddr_d;
   logic [2:0]      ahb_wsize_d;
-  (* mark_debug = "true" *) logic            ahb_wphase_valid;  
+  logic            ahb_wphase_valid;  
 
   // race condition fix
   logic [DW-1:0]   wdata_first;
@@ -240,21 +240,21 @@ module ahb_to_axi4_burst #(
   logic            wr_d_wvalid;
   logic            wr_d_last_issue;
   logic            wr_d_fire;
-  (* mark_debug = "true" *) logic            fix_ahb_fire;
+  logic            fix_ahb_fire;
   logic            fix_flush_wvalid;
   logic            fix_flush_last_issue;
 
   // loops fix
-  (* mark_debug = "true" *) logic             hsel_q;
-  (* mark_debug = "true" *) logic             hreadyin_q;
-  (* mark_debug = "true" *) logic [AW-1:0]    haddr_q;
+  logic             hsel_q;
+  logic             hreadyin_q;
+  logic [AW-1:0]    haddr_q;
   logic [2:0]       hburst_q;
   logic             hmastlock_q;
   logic [3:0]       hprot_q;
-  (* mark_debug = "true" *) logic [2:0]       hsize_q;
-  (* mark_debug = "true" *) logic [1:0]       htrans_q;
-  (* mark_debug = "true" *) logic             hwrite_q;
-  (* mark_debug = "true" *) logic             rd_q_holds_current_start;
+  logic [2:0]       hsize_q;
+  logic [1:0]       htrans_q;
+  logic             hwrite_q;
+  logic             rd_q_holds_current_start;
 
   // Functional helpers for read-side handoff decisions.
   // These are intentionally separate from dbg_* so the fix does not depend on
@@ -279,13 +279,13 @@ module ahb_to_axi4_burst #(
 
   // AXI->AHB read-return hold register.
   // Do not expose raw RVALID/RDATA directly to HREADY/HRDATA.
-  (* mark_debug = "true" *) logic [DW-1:0] rd_buf_data;
+  logic [DW-1:0] rd_buf_data;
   logic [1:0]    rd_buf_resp;
-  (* mark_debug = "true" *) logic          rd_buf_valid;
-  (* mark_debug = "true" *) logic          raw_r_accept;
-  (* mark_debug = "true" *) logic          raw_r_capture;
+  logic          rd_buf_valid;
+  logic          raw_r_accept;
+  logic          raw_r_capture;
 
-  (* mark_debug = "true" *) logic          rd_fence_seen_idle;
+  logic          rd_fence_seen_idle;
   
 
   logic [DW/8-1:0] busy_wstrb;   // strobe saved on entry to POST_BUSY
@@ -1849,13 +1849,13 @@ module ahb_to_axi4_burst #(
   localparam logic [7:0] DBG_TRIP_RD_REPEAT_DELIVER = 8'd13;
   localparam logic [7:0] DBG_TRIP_RD_LASTBEAT_NO_DELIVER = 8'd14;
 
-  (* mark_debug = "true" *) logic dbg_ahb_ap_fire;
-  (* mark_debug = "true" *) logic dbg_ar_fire;
-  (* mark_debug = "true" *) logic dbg_aw_fire;
-  (* mark_debug = "true" *) logic dbg_w_fire;
-  (* mark_debug = "true" *) logic dbg_b_fire;
-  (* mark_debug = "true" *) logic dbg_live_interleave;
-  (* mark_debug = "true" *) logic dbg_q_interleave;
+  logic dbg_ahb_ap_fire;
+  logic dbg_ar_fire;
+  logic dbg_aw_fire;
+  logic dbg_w_fire;
+  logic dbg_b_fire;
+  logic dbg_live_interleave;
+  logic dbg_q_interleave;
 
   assign dbg_ahb_ap_fire = HREADY && HREADYIN && HSEL && HTRANS[1];
   assign dbg_ar_fire     = ARVALID && ARREADY;
@@ -1984,112 +1984,112 @@ module ahb_to_axi4_burst #(
                             && HREADY
                             && !rd_buf_resp[1];
 
-  (* mark_debug = "true" *) logic        dbg_trip;
-  (* mark_debug = "true" *) logic        dbg_trip_sticky;
-  (* mark_debug = "true" *) logic [7:0]  dbg_trip_code_live;
-  (* mark_debug = "true" *) logic [7:0]  dbg_trip_cause;
-  (* mark_debug = "true" *) logic        dbg_rd_outstanding;
-  (* mark_debug = "true" *) logic        dbg_wr_outstanding;
-  (* mark_debug = "true" *) logic [31:0] dbg_cycle_counter;
-  (* mark_debug = "true" *) logic [31:0] dbg_trip_cycle;
-  (* mark_debug = "true" *) state_t      dbg_trip_state;
-  (* mark_debug = "true" *) logic [AW-1:0] dbg_trip_ap_addr;
-  (* mark_debug = "true" *) logic [AW-1:0] dbg_trip_haddr;
-  (* mark_debug = "true" *) logic [7:0]  dbg_trip_beat_cnt;
-  (* mark_debug = "true" *) logic [IBUF_CNT_W-1:0] dbg_trip_acc_cnt;
-  (* mark_debug = "true" *) logic [IBUF_IDX_W-1:0] dbg_trip_flush_ptr;
-  (* mark_debug = "true" *) logic [1:0]  dbg_trip_htrans;
-  (* mark_debug = "true" *) logic        dbg_trip_hwrite;
-  (* mark_debug = "true" *) logic [1:0]  dbg_trip_rresp;
-  (* mark_debug = "true" *) logic        dbg_trip_rlast;
+  logic        dbg_trip;
+  logic        dbg_trip_sticky;
+  logic [7:0]  dbg_trip_code_live;
+  logic [7:0]  dbg_trip_cause;
+  logic        dbg_rd_outstanding;
+  logic        dbg_wr_outstanding;
+  logic [31:0] dbg_cycle_counter;
+  logic [31:0] dbg_trip_cycle;
+  state_t      dbg_trip_state;
+  logic [AW-1:0] dbg_trip_ap_addr;
+  logic [AW-1:0] dbg_trip_haddr;
+  logic [7:0]  dbg_trip_beat_cnt;
+  logic [IBUF_CNT_W-1:0] dbg_trip_acc_cnt;
+  logic [IBUF_IDX_W-1:0] dbg_trip_flush_ptr;
+  logic [1:0]  dbg_trip_htrans;
+  logic        dbg_trip_hwrite;
+  logic [1:0]  dbg_trip_rresp;
+  logic        dbg_trip_rlast;
 
-  (* mark_debug = "true" *) logic        dbg_fix_write_unproven;
-  (* mark_debug = "true" *) logic [31:0] dbg_fix_write_cycle;
-  (* mark_debug = "true" *) state_t      dbg_fix_write_state;
-  (* mark_debug = "true" *) logic [AW-1:0] dbg_fix_write_haddr;
-  (* mark_debug = "true" *) logic [1:0]  dbg_fix_write_htrans;
-  (* mark_debug = "true" *) logic        dbg_fix_write_hwrite;
-  (* mark_debug = "true" *) logic        dbg_fix_write_hreadyin;
-  (* mark_debug = "true" *) logic        dbg_fix_write_ahb_wphase_valid;
-  (* mark_debug = "true" *) logic        dbg_fix_write_pnd_wfirst_valid;
-  (* mark_debug = "true" *) logic [DW-1:0] dbg_fix_write_hwd_data;
-  (* mark_debug = "true" *) logic [DW/8-1:0] dbg_fix_write_hwd_strb;
-  (* mark_debug = "true" *) logic [IBUF_CNT_W-1:0] dbg_fix_write_acc_cnt;
-  (* mark_debug = "true" *) logic [IBUF_IDX_W-1:0] dbg_fix_write_flush_ptr;
+  logic        dbg_fix_write_unproven;
+  logic [31:0] dbg_fix_write_cycle;
+  state_t      dbg_fix_write_state;
+  logic [AW-1:0] dbg_fix_write_haddr;
+  logic [1:0]  dbg_fix_write_htrans;
+  logic        dbg_fix_write_hwrite;
+  logic        dbg_fix_write_hreadyin;
+  logic        dbg_fix_write_ahb_wphase_valid;
+  logic        dbg_fix_write_pnd_wfirst_valid;
+  logic [DW-1:0] dbg_fix_write_hwd_data;
+  logic [DW/8-1:0] dbg_fix_write_hwd_strb;
+  logic [IBUF_CNT_W-1:0] dbg_fix_write_acc_cnt;
+  logic [IBUF_IDX_W-1:0] dbg_fix_write_flush_ptr;
 
-  (* mark_debug = "true" *) logic        dbg_rd_pop_while_not_ready;
-  (* mark_debug = "true" *) logic [31:0] dbg_rd_pop_cycle;
-  (* mark_debug = "true" *) state_t      dbg_rd_pop_state;
-  (* mark_debug = "true" *) logic [AW-1:0] dbg_rd_pop_haddr;
-  (* mark_debug = "true" *) logic [7:0]  dbg_rd_pop_beat_cnt;
-  (* mark_debug = "true" *) logic        dbg_rd_pop_hready;
-  (* mark_debug = "true" *) logic [1:0]  dbg_rd_pop_resp;
+  logic        dbg_rd_pop_while_not_ready;
+  logic [31:0] dbg_rd_pop_cycle;
+  state_t      dbg_rd_pop_state;
+  logic [AW-1:0] dbg_rd_pop_haddr;
+  logic [7:0]  dbg_rd_pop_beat_cnt;
+  logic        dbg_rd_pop_hready;
+  logic [1:0]  dbg_rd_pop_resp;
 
-  (* mark_debug = "true" *) logic        dbg_pnd_align_unproven;
-  (* mark_debug = "true" *) logic        dbg_pnd_flush_unproven;
-  (* mark_debug = "true" *) logic        dbg_rd_repeat_deliver;
-  (* mark_debug = "true" *) logic        dbg_rd_lastbeat_no_deliver;
-  (* mark_debug = "true" *) logic [31:0] dbg_pnd_align_cycle;
-  (* mark_debug = "true" *) logic [31:0] dbg_pnd_flush_cycle;
-  (* mark_debug = "true" *) logic [31:0] dbg_rd_repeat_cycle;
-  (* mark_debug = "true" *) logic [31:0] dbg_rd_lastbeat_cycle;
-  (* mark_debug = "true" *) logic [15:0] dbg_rd_buf_capture_seq_dbg;
-  (* mark_debug = "true" *) logic [15:0] dbg_rd_last_deliver_seq_dbg;
+  logic        dbg_pnd_align_unproven;
+  logic        dbg_pnd_flush_unproven;
+  logic        dbg_rd_repeat_deliver;
+  logic        dbg_rd_lastbeat_no_deliver;
+  logic [31:0] dbg_pnd_align_cycle;
+  logic [31:0] dbg_pnd_flush_cycle;
+  logic [31:0] dbg_rd_repeat_cycle;
+  logic [31:0] dbg_rd_lastbeat_cycle;
+  logic [15:0] dbg_rd_buf_capture_seq_dbg;
+  logic [15:0] dbg_rd_last_deliver_seq_dbg;
 
-  (* mark_debug = "true" *) logic        dbg_rd_live_q_disagree;
-  (* mark_debug = "true" *) logic [31:0] dbg_rd_live_q_cycle;
-  (* mark_debug = "true" *) state_t      dbg_rd_live_q_state;
-  (* mark_debug = "true" *) logic [AW-1:0] dbg_rd_live_haddr;
-  (* mark_debug = "true" *) logic [AW-1:0] dbg_rd_q_haddr;
-  (* mark_debug = "true" *) logic [1:0]  dbg_rd_live_htrans;
-  (* mark_debug = "true" *) logic [1:0]  dbg_rd_q_htrans;
-  (* mark_debug = "true" *) logic        dbg_rd_live_hwrite;
-  (* mark_debug = "true" *) logic        dbg_rd_q_hwrite;
-  (* mark_debug = "true" *) logic [2:0]  dbg_rd_live_hsize;
-  (* mark_debug = "true" *) logic [2:0]  dbg_rd_q_hsize;
-  (* mark_debug = "true" *) logic [AW-1:0] dbg_rd_live_ap_addr;
-  (* mark_debug = "true" *) logic [2:0]  dbg_rd_live_ap_size;
+  logic        dbg_rd_live_q_disagree;
+  logic [31:0] dbg_rd_live_q_cycle;
+  state_t      dbg_rd_live_q_state;
+  logic [AW-1:0] dbg_rd_live_haddr;
+  logic [AW-1:0] dbg_rd_q_haddr;
+  logic [1:0]  dbg_rd_live_htrans;
+  logic [1:0]  dbg_rd_q_htrans;
+  logic        dbg_rd_live_hwrite;
+  logic        dbg_rd_q_hwrite;
+  logic [2:0]  dbg_rd_live_hsize;
+  logic [2:0]  dbg_rd_q_hsize;
+  logic [AW-1:0] dbg_rd_live_ap_addr;
+  logic [2:0]  dbg_rd_live_ap_size;
 
-  (* mark_debug = "true" *) state_t      dbg_prev_state;
+  state_t      dbg_prev_state;
 
-  (* mark_debug = "true" *) logic [AW-1:0] dbg_last_ahb_addr;
-  (* mark_debug = "true" *) logic [2:0]  dbg_last_ahb_size;
-  (* mark_debug = "true" *) logic [2:0]  dbg_last_ahb_burst;
-  (* mark_debug = "true" *) logic [1:0]  dbg_last_ahb_trans;
-  (* mark_debug = "true" *) logic        dbg_last_ahb_write;
-  (* mark_debug = "true" *) logic [3:0]  dbg_last_ahb_prot;
-  (* mark_debug = "true" *) logic [DW-1:0] dbg_last_hwd_data;
-  (* mark_debug = "true" *) logic [DW/8-1:0] dbg_last_hwd_strb;
+  logic [AW-1:0] dbg_last_ahb_addr;
+  logic [2:0]  dbg_last_ahb_size;
+  logic [2:0]  dbg_last_ahb_burst;
+  logic [1:0]  dbg_last_ahb_trans;
+  logic        dbg_last_ahb_write;
+  logic [3:0]  dbg_last_ahb_prot;
+  logic [DW-1:0] dbg_last_hwd_data;
+  logic [DW/8-1:0] dbg_last_hwd_strb;
 
-  (* mark_debug = "true" *) logic [AW-1:0] dbg_last_ar_addr;
-  (* mark_debug = "true" *) logic [7:0]  dbg_last_ar_len;
-  (* mark_debug = "true" *) logic [2:0]  dbg_last_ar_size;
-  (* mark_debug = "true" *) logic [1:0]  dbg_last_ar_burst;
+  logic [AW-1:0] dbg_last_ar_addr;
+  logic [7:0]  dbg_last_ar_len;
+  logic [2:0]  dbg_last_ar_size;
+  logic [1:0]  dbg_last_ar_burst;
 
-  (* mark_debug = "true" *) logic [DW-1:0] dbg_last_r_data;
-  (* mark_debug = "true" *) logic [1:0]  dbg_last_r_resp;
-  (* mark_debug = "true" *) logic        dbg_last_r_last;
-  (* mark_debug = "true" *) logic        dbg_last_r_was_capture;
-  (* mark_debug = "true" *) state_t      dbg_last_r_state;
-  (* mark_debug = "true" *) logic [7:0]  dbg_last_r_beat_cnt;
+  logic [DW-1:0] dbg_last_r_data;
+  logic [1:0]  dbg_last_r_resp;
+  logic        dbg_last_r_last;
+  logic        dbg_last_r_was_capture;
+  state_t      dbg_last_r_state;
+  logic [7:0]  dbg_last_r_beat_cnt;
 
-  (* mark_debug = "true" *) logic [AW-1:0] dbg_last_aw_addr;
-  (* mark_debug = "true" *) logic [7:0]  dbg_last_aw_len;
-  (* mark_debug = "true" *) logic [2:0]  dbg_last_aw_size;
-  (* mark_debug = "true" *) logic [1:0]  dbg_last_aw_burst;
+  logic [AW-1:0] dbg_last_aw_addr;
+  logic [7:0]  dbg_last_aw_len;
+  logic [2:0]  dbg_last_aw_size;
+  logic [1:0]  dbg_last_aw_burst;
 
-  (* mark_debug = "true" *) logic [DW-1:0] dbg_last_w_data;
-  (* mark_debug = "true" *) logic [DW/8-1:0] dbg_last_w_strb;
-  (* mark_debug = "true" *) logic        dbg_last_w_last;
-  (* mark_debug = "true" *) logic [IBUF_IDX_W-1:0] dbg_last_w_flush_ptr;
+  logic [DW-1:0] dbg_last_w_data;
+  logic [DW/8-1:0] dbg_last_w_strb;
+  logic        dbg_last_w_last;
+  logic [IBUF_IDX_W-1:0] dbg_last_w_flush_ptr;
 
-  (* mark_debug = "true" *) logic [1:0]  dbg_last_b_resp;
+  logic [1:0]  dbg_last_b_resp;
 
-  (* mark_debug = "true" *) logic [7:0]  dbg_hist0_code, dbg_hist1_code, dbg_hist2_code, dbg_hist3_code;
-  (* mark_debug = "true" *) state_t      dbg_hist0_state, dbg_hist1_state, dbg_hist2_state, dbg_hist3_state;
-  (* mark_debug = "true" *) logic [AW-1:0] dbg_hist0_ap_addr, dbg_hist1_ap_addr, dbg_hist2_ap_addr, dbg_hist3_ap_addr;
-  (* mark_debug = "true" *) logic [AW-1:0] dbg_hist0_haddr,   dbg_hist1_haddr,   dbg_hist2_haddr,   dbg_hist3_haddr;
-  (* mark_debug = "true" *) logic [7:0]  dbg_hist0_beat_cnt, dbg_hist1_beat_cnt, dbg_hist2_beat_cnt, dbg_hist3_beat_cnt;
+  logic [7:0]  dbg_hist0_code, dbg_hist1_code, dbg_hist2_code, dbg_hist3_code;
+  state_t      dbg_hist0_state, dbg_hist1_state, dbg_hist2_state, dbg_hist3_state;
+  logic [AW-1:0] dbg_hist0_ap_addr, dbg_hist1_ap_addr, dbg_hist2_ap_addr, dbg_hist3_ap_addr;
+  logic [AW-1:0] dbg_hist0_haddr,   dbg_hist1_haddr,   dbg_hist2_haddr,   dbg_hist3_haddr;
+  logic [7:0]  dbg_hist0_beat_cnt, dbg_hist1_beat_cnt, dbg_hist2_beat_cnt, dbg_hist3_beat_cnt;
 
   logic dbg_trip_ar_double_p;
   logic dbg_trip_r_no_rd_p;
