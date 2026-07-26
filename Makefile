@@ -1,5 +1,8 @@
 SIM ?= verilator
 TOPLEVEL_LANG ?= verilog
+STREAM_WR_BUF_BEATS ?= 8
+MAX_INCR_BEATS ?= 16
+ENABLE_DEBUG ?= 0
 
 RTL_DIR ?= $(PWD)/rtl
 TB_DIR  ?= $(PWD)/tb
@@ -11,7 +14,8 @@ WRAPPER := ahb_to_axi4_burst_cocotb_wrapper_v3.sv
 
 VERILOG_SOURCES := \
 	$(TB_DIR)/$(WRAPPER) \
-	$(DUT_SOURCES)
+	$(DUT_SOURCES) \
+	$(RTL_DIR)/axi_perf_monitor.sv
 
 
 MODULE   := test_ahb_to_axi4_burst
@@ -22,7 +26,11 @@ EXTRA_ARGS += --timing --Wno-fatal
 # generated .vcd. # newer way: EXTRA_ARGS += --trace-vcd
 EXTRA_ARGS += --trace
 
-COMPILE_ARGS += -Wall -Wno-DECLFILENAME -Wno-UNUSEDSIGNAL -Wno-WIDTH
+COMPILE_ARGS += -Wall -Wno-DECLFILENAME -Wno-UNUSEDSIGNAL -Wno-WIDTH \
+	-GSTREAM_WR_BUF_BEATS=$(STREAM_WR_BUF_BEATS) \
+	-GMAX_INCR_BEATS=$(MAX_INCR_BEATS) \
+	-GENABLE_DEBUG=$(ENABLE_DEBUG)
+export STREAM_WR_BUF_BEATS MAX_INCR_BEATS ENABLE_DEBUG
 
 COCOTB_HDL_TIMEUNIT      := 1ns
 COCOTB_HDL_TIMEPRECISION := 1ps
@@ -38,7 +46,20 @@ SBY ?= sby
 
 FORMAL_SBY := $(sort $(wildcard $(FORMAL_DIR)/*.sby))
 
-.PHONY: formal-list formalverif formalverif-par formal-clean
+.PHONY: formal-list formalverif formalverif-par formal-clean stream-wr-buf-param-tests
+
+# Run each elaborated STREAM_WR_BUF_BEATS setting against its directed test.
+# The normal suite runs the default setting (8).
+stream-wr-buf-param-tests:
+	$(MAKE) clean
+	$(MAKE) STREAM_WR_BUF_BEATS=1 TESTCASE=test_stream_wr_buf_beats_1
+	$(MAKE) clean
+	$(MAKE) STREAM_WR_BUF_BEATS=4 TESTCASE=test_stream_wr_buf_beats_4
+	$(MAKE) clean
+	$(MAKE) STREAM_WR_BUF_BEATS=8 TESTCASE=test_incr8_fixed_write_streams_w_before_ahb_burst_finishes
+	$(MAKE) clean
+	$(MAKE) STREAM_WR_BUF_BEATS=16 TESTCASE=test_stream_wr_buf_beats_16
+	$(MAKE) clean
 
 formal-list:
 	@printf '%s\n' $(FORMAL_SBY)

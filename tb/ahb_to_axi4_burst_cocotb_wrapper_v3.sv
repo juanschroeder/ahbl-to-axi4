@@ -2,7 +2,9 @@ module ahb_to_axi4_burst_cocotb_wrapper_v3 #(
   parameter int unsigned AW = 32,
   parameter int unsigned DW = 64,
   parameter int unsigned IW = 4,
-  parameter int unsigned MAX_INCR_BEATS = 16
+  parameter int unsigned MAX_INCR_BEATS = 16,
+  parameter int unsigned STREAM_WR_BUF_BEATS = 8,
+  parameter bit ENABLE_DEBUG = 1'b0
 ) (
   input  logic               clk,
   input  logic               resetn,
@@ -128,7 +130,9 @@ module ahb_to_axi4_burst_cocotb_wrapper_v3 #(
     .AW (AW),
     .DW (DW),
     .IW (IW),
-    .MAX_INCR_BEATS(MAX_INCR_BEATS)
+    .MAX_INCR_BEATS(MAX_INCR_BEATS),
+    .STREAM_WR_BUF_BEATS(STREAM_WR_BUF_BEATS),
+    .ENABLE_DEBUG(ENABLE_DEBUG)
   ) dut (
     .clk        (clk),
     .resetn     (resetn),
