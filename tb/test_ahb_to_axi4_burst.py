@@ -1,4 +1,5 @@
 import cocotb
+import os
 from cocotb.clock import Clock
 from cocotb.triggers import ClockCycles, RisingEdge, FallingEdge, ReadOnly, NextTimeStep, Timer, Event, with_timeout
 from cocotbext.ahb import AHBBus, AHBLiteMaster
@@ -7197,6 +7198,10 @@ def _try_int_sig(sig):
         return None
 
 
+def _bridge_debug(dut):
+    return dut.dut
+
+
 BUG20_STATE_NAMES = {
     0: "ST_IDLE",
     1: "ST_WR_PND_ALIGN",
@@ -7246,8 +7251,8 @@ def _bug20_snapshot(dut, tag):
         "rready": _try_int_sig(dut.m_axi_rready),
         "rdata": _try_int_sig(dut.m_axi_rdata),
         "rlast": _try_int_sig(dut.m_axi_rlast),
-        "dbg_trip": _try_int_sig(dut.dut.dbg_trip_sticky),
-        "dbg_cause": _try_int_sig(dut.dut.dbg_trip_cause),
+        "dbg_trip": _try_int_sig(_bridge_debug(dut).dbg_trip_sticky),
+        "dbg_cause": _try_int_sig(_bridge_debug(dut).dbg_trip_cause),
     }
 
 
@@ -11174,8 +11179,8 @@ async def test_regression_bug9_last_read_beat_then_write_nonseq_no_idle_gap(dut)
     )
 
     # The buggy bridge trips here with dbg_trip_cause=10 (RD_LIVE_Q_DISAGREE).
-    dbg_trip = int(dut.dut.dbg_trip.value)
-    dbg_cause = int(dut.dut.dbg_trip_cause.value)
+    dbg_trip = int(_bridge_debug(dut).dbg_trip.value)
+    dbg_cause = int(_bridge_debug(dut).dbg_trip_cause.value)
     assert dbg_trip == 0, (
         f"BUG9: dbg_trip fired (cause={dbg_cause}). "
         f"Expected clean read-last-beat -> write-NONSEQ handoff."
@@ -11336,9 +11341,9 @@ async def test_regression_bug10_fixed_incr4_write_busy_does_not_consume_spurious
             f"BUG10 writeback: mem[0x{WRITE_ADDR + i*8:08x}] = {got!r}, expected 0x{exp:016x}"
         )
 
-    dbg_unproven = int(dut.dut.dbg_fix_write_unproven.value)
-    dbg_trip = int(dut.dut.dbg_trip.value)
-    dbg_cause = int(dut.dut.dbg_trip_cause.value)
+    dbg_unproven = int(_bridge_debug(dut).dbg_fix_write_unproven.value)
+    dbg_trip = int(_bridge_debug(dut).dbg_trip.value)
+    dbg_cause = int(_bridge_debug(dut).dbg_trip_cause.value)
     assert dbg_unproven == 0, (
         "BUG10: dbg_fix_write_unproven fired. "
         "ST_WR_D consumed a fixed-write beat without ahb_wphase_valid."
@@ -11870,7 +11875,7 @@ async def test_regression_bug12_fixed_incr4_write_busy_positions(dut):
             assert got == value, (
                 f"BUG12d busy@{busy_pos}: mem beat {i} got {got!r}, expected 0x{value:016x}"
             )
-        assert int(dut.dut.dbg_fix_write_unproven.value) == 0, (
+        assert int(_bridge_debug(dut).dbg_fix_write_unproven.value) == 0, (
             f"BUG12d busy@{busy_pos}: dbg_fix_write_unproven unexpectedly high"
         )
 
@@ -12060,7 +12065,7 @@ async def test_regression_bug13_fixed_write_bresp_gap_deselected_then_pending_fi
             f"BUG13 memB beat {i}: got {got!r}, expected 0x{value:016x}"
         )
 
-    assert int(dut.dut.dbg_pnd_align_unproven.value) == 0, (
+    assert int(_bridge_debug(dut).dbg_pnd_align_unproven.value) == 0, (
         "BUG13: dbg_pnd_align_unproven went high during pending fixed-write recovery"
     )
 
@@ -12118,12 +12123,12 @@ def _bug18_snapshot_line(dut, tag):
     htrans_q = _bug18_try_int(dut.dut.htrans_q)
     hreadyin_q = _bug18_try_int(dut.dut.hreadyin_q)
     rd_q_holds_current_start = _bug18_try_int(dut.dut.rd_q_holds_current_start)
-    dbg_last_ar_addr = _bug18_try_int(dut.dut.dbg_last_ar_addr)
-    dbg_last_r_data = _bug18_try_int(dut.dut.dbg_last_r_data)
-    dbg_trip_sticky = _bug18_try_int(dut.dut.dbg_trip_sticky)
-    dbg_trip_cause = _bug18_try_int(dut.dut.dbg_trip_cause)
-    dbg_live_interleave = _bug18_try_int(dut.dut.dbg_live_interleave)
-    dbg_q_interleave = _bug18_try_int(dut.dut.dbg_q_interleave)
+    dbg_last_ar_addr = _bug18_try_int(_bridge_debug(dut).dbg_last_ar_addr)
+    dbg_last_r_data = _bug18_try_int(_bridge_debug(dut).dbg_last_r_data)
+    dbg_trip_sticky = _bug18_try_int(_bridge_debug(dut).dbg_trip_sticky)
+    dbg_trip_cause = _bug18_try_int(_bridge_debug(dut).dbg_trip_cause)
+    dbg_live_interleave = _bug18_try_int(_bridge_debug(dut).dbg_live_interleave)
+    dbg_q_interleave = _bug18_try_int(_bridge_debug(dut).dbg_q_interleave)
 
     haddr = int(dut.haddr.value)
     htrans = int(dut.htrans.value)
@@ -12797,8 +12802,8 @@ async def _bug20_monitor_no_read_pop_while_stalled(dut, trace, stop_evt):
             "beat_cnt": _bug18_try_int(dut.dut.beat_cnt),
             "rd_buf_valid": _bug18_try_int(dut.dut.rd_buf_valid),
             "hready": int(dut.hready.value),
-            "dbg_trip_sticky": _bug18_try_int(dut.dut.dbg_trip_sticky),
-            "dbg_trip_cause": _bug18_try_int(dut.dut.dbg_trip_cause),
+            "dbg_trip_sticky": _bug18_try_int(_bridge_debug(dut).dbg_trip_sticky),
+            "dbg_trip_cause": _bug18_try_int(_bridge_debug(dut).dbg_trip_cause),
         }
 
         if (
@@ -12947,8 +12952,8 @@ async def _ahb_read_incr8_with_unaccepted_sameaddr_glitch_then_real_followon_bug
         state = _bug18_try_int(dut.dut.state)
         beat_cnt = _bug18_try_int(dut.dut.beat_cnt)
         rd_buf_valid = _bug18_try_int(dut.dut.rd_buf_valid)
-        dbg_trip_sticky = _bug18_try_int(dut.dut.dbg_trip_sticky)
-        dbg_trip_cause = _bug18_try_int(dut.dut.dbg_trip_cause)
+        dbg_trip_sticky = _bug18_try_int(_bridge_debug(dut).dbg_trip_sticky)
+        dbg_trip_cause = _bug18_try_int(_bridge_debug(dut).dbg_trip_cause)
 
         if int(dut.m_axi_arvalid.value) and int(dut.m_axi_arready.value):
             _bug18_trace_append(trace, dut, "BUG21 AXI AR handshake")
@@ -13637,8 +13642,8 @@ async def test_regression_bug20_same_addr_fixed_read_handoff_no_pop_while_stalle
 
     violation = await with_timeout(bug20_mon, 10, "us")
     trace_tail = _bug18_trace_tail(trace)
-    dbg_trip_sticky = _bug18_try_int(dut.dut.dbg_trip_sticky)
-    dbg_trip_cause = _bug18_try_int(dut.dut.dbg_trip_cause)
+    dbg_trip_sticky = _bug18_try_int(_bridge_debug(dut).dbg_trip_sticky)
+    dbg_trip_cause = _bug18_try_int(_bridge_debug(dut).dbg_trip_cause)
 
     assert got1 == READ_DATA, (
         f"BUG20 read1 mismatch: expected {READ_DATA}, got {got1}\n{trace_tail}"
@@ -13724,8 +13729,8 @@ async def test_regression_bug20_fixed_read_to_read_no_idle_gap_no_pop_while_stal
 
     violation = await with_timeout(bug20_mon, 10, "us")
     trace_tail = _bug18_trace_tail(trace)
-    dbg_trip_sticky = _bug18_try_int(dut.dut.dbg_trip_sticky)
-    dbg_trip_cause = _bug18_try_int(dut.dut.dbg_trip_cause)
+    dbg_trip_sticky = _bug18_try_int(_bridge_debug(dut).dbg_trip_sticky)
+    dbg_trip_cause = _bug18_try_int(_bridge_debug(dut).dbg_trip_cause)
 
     assert got1 == READ1_DATA, (
         f"BUG20 first read mismatch: expected {READ1_DATA}, got {got1}\n{trace_tail}"
@@ -13818,8 +13823,8 @@ async def test_regression_bug21_unaccepted_same_addr_nonseq_must_not_spawn_pendi
     violation = await with_timeout(bug20_mon, 10, "us")
     violation21 = await with_timeout(bug21_mon, 10, "us")
     trace_tail = _bug18_trace_tail(trace)
-    dbg_trip_sticky = _bug18_try_int(dut.dut.dbg_trip_sticky)
-    dbg_trip_cause = _bug18_try_int(dut.dut.dbg_trip_cause)
+    dbg_trip_sticky = _bug18_try_int(_bridge_debug(dut).dbg_trip_sticky)
+    dbg_trip_cause = _bug18_try_int(_bridge_debug(dut).dbg_trip_cause)
 
     assert bursts[0][0] == read1_addr and bursts[0][1] == 7, (
         f"BUG21 first AR mismatch: got {bursts[0]}\n{trace_tail}"
@@ -14220,8 +14225,8 @@ async def _explore_bug20_timing_sweep_no_pop_while_stalled(dut):
             stop_evt.set()
 
         violation = await with_timeout(bug20_mon, 10, "us")
-        dbg_trip_sticky = _bug18_try_int(dut.dut.dbg_trip_sticky)
-        dbg_trip_cause = _bug18_try_int(dut.dut.dbg_trip_cause)
+        dbg_trip_sticky = _bug18_try_int(_bridge_debug(dut).dbg_trip_sticky)
+        dbg_trip_cause = _bug18_try_int(_bridge_debug(dut).dbg_trip_cause)
 
         if violation is not None:
             failures.append(f"{case_name}: {violation}\n{_bug18_trace_tail(trace)}")
@@ -14959,7 +14964,7 @@ async def test_regression_bug22g_st_wr_d_early_read_nonseq_is_latched(dut):
         "BUG22G: ST_WR_D accepted an early read NONSEQ but did not latch it. "
         f"state={int(dut.dut.state.value)} HREADY={int(dut.hready.value)} "
         f"beat_cnt={int(dut.dut.beat_cnt.value)} "
-        f"last_ahb=0x{int(dut.dut.dbg_last_ahb_addr.value):08x}"
+        f"last_ahb=0x{int(_bridge_debug(dut).dbg_last_ahb_addr.value):08x}"
     )
     assert int(dut.dut.pnd_write.value) == 0, "BUG22G: pending transfer should be a read"
     assert int(dut.dut.pnd_addr.value) == READ_ADDR, (
@@ -16096,3 +16101,348 @@ async def test_usb_ohci_descriptor_store_stream_then_clf(dut):
             f"expected data=0x{expected_data:016x} "
             f"strb=0x{expected_strb:02x} last=1"
         )
+
+
+@cocotb.test()
+async def test_incr8_fixed_write_streams_w_before_ahb_burst_finishes(dut):
+    """An INCR8 cache-line write must overlap AHB reception and AXI W output."""
+    set_test_id(dut)
+    await setup_dut_no_axi_slave(dut)
+
+    addr = 0x8001_0000
+    data = [0xD500_0000_0000_0000 | i for i in range(8)]
+    observed = []
+    first_w_htrans = None
+
+    dut.m_axi_awready.value = 1
+    dut.m_axi_wready.value = 1
+    dut.m_axi_bvalid.value = 0
+    dut.m_axi_bresp.value = 0
+
+    async def axi_slave():
+        nonlocal first_w_htrans
+        while True:
+            await RisingEdge(dut.clk)
+            await ReadOnly()
+            if int(dut.m_axi_wvalid.value) and int(dut.m_axi_wready.value):
+                if first_w_htrans is None:
+                    first_w_htrans = int(dut.htrans.value)
+                observed.append((
+                    int(dut.m_axi_wdata.value),
+                    int(dut.m_axi_wstrb.value),
+                    int(dut.m_axi_wlast.value),
+                ))
+                if int(dut.m_axi_wlast.value):
+                    break
+
+        await NextTimeStep()
+        dut.m_axi_bvalid.value = 1
+        while True:
+            await RisingEdge(dut.clk)
+            if int(dut.m_axi_bvalid.value) and int(dut.m_axi_bready.value):
+                break
+        dut.m_axi_bvalid.value = 0
+
+    slave_task = cocotb.start_soon(axi_slave())
+    await with_timeout(
+        ahb_write_inc_burst_manual_with_hprot(
+            dut, addr, data, size_bytes=8, fixed=True, hprot=0b0011
+        ),
+        30,
+        "us",
+    )
+    await with_timeout(slave_task, 30, "us")
+
+    assert first_w_htrans == AHB_SEQ, (
+        "fixed INCR8 AXI W began only after the AHB burst had finished; "
+        f"first W observed with HTRANS={first_w_htrans}"
+    )
+    assert observed == [(word, 0xFF, int(i == 7)) for i, word in enumerate(data)]
+
+
+async def _check_configured_stream_write(dut, nbeats):
+    """Exercise the fixed cache-line write selected by STREAM_WR_BUF_BEATS."""
+    set_test_id(dut)
+    await setup_dut_no_axi_slave(dut)
+
+    addr = 0x8001_1000
+    data = [0xC600_0000_0000_0000 | i for i in range(nbeats)]
+    captured_awlen = None
+    observed = []
+    first_w_htrans = None
+
+    dut.m_axi_awready.value = 1
+    dut.m_axi_wready.value = 1
+    dut.m_axi_bvalid.value = 0
+    dut.m_axi_bresp.value = 0
+
+    async def axi_slave():
+        nonlocal captured_awlen, first_w_htrans
+        while captured_awlen is None:
+            await RisingEdge(dut.clk)
+            await ReadOnly()
+            if int(dut.m_axi_awvalid.value) and int(dut.m_axi_awready.value):
+                captured_awlen = int(dut.m_axi_awlen.value)
+
+        while True:
+            await RisingEdge(dut.clk)
+            await ReadOnly()
+            if int(dut.m_axi_wvalid.value) and int(dut.m_axi_wready.value):
+                if first_w_htrans is None:
+                    first_w_htrans = int(dut.htrans.value)
+                observed.append((
+                    int(dut.m_axi_wdata.value),
+                    int(dut.m_axi_wstrb.value),
+                    int(dut.m_axi_wlast.value),
+                ))
+                if int(dut.m_axi_wlast.value):
+                    break
+
+        await NextTimeStep()
+        dut.m_axi_bvalid.value = 1
+        while True:
+            await RisingEdge(dut.clk)
+            if int(dut.m_axi_bvalid.value) and int(dut.m_axi_bready.value):
+                break
+        dut.m_axi_bvalid.value = 0
+
+    slave_task = cocotb.start_soon(axi_slave())
+    await with_timeout(
+        ahb_write_inc_burst_manual_with_hprot(
+            dut, addr, data, size_bytes=8, fixed=True, hprot=0b0011
+        ),
+        30,
+        "us",
+    )
+    await with_timeout(slave_task, 30, "us")
+
+    assert captured_awlen == nbeats - 1
+    assert observed == [(word, 0xFF, int(i == nbeats - 1))
+                        for i, word in enumerate(data)]
+    # A single transfer has no later AHB beat with which W can overlap.  For
+    # multi-beat cache lines, the first W beat must begin during the AHB burst.
+    if nbeats > 1:
+        assert first_w_htrans == AHB_SEQ, (
+            f"STREAM_WR_BUF_BEATS={nbeats} did not overlap AHB and AXI W; "
+            f"first W saw HTRANS={first_w_htrans}"
+        )
+
+
+@cocotb.test(skip=os.getenv("STREAM_WR_BUF_BEATS", "8") != "1")
+async def test_stream_wr_buf_beats_1(dut):
+    """Configured SINGLE cache-line write remains an immediate AXI write."""
+    await _check_configured_stream_write(dut, 1)
+
+
+@cocotb.test(skip=os.getenv("STREAM_WR_BUF_BEATS", "8") != "4")
+async def test_stream_wr_buf_beats_4(dut):
+    """Configured INCR4 cache-line write streams before AHB completion."""
+    await _check_configured_stream_write(dut, 4)
+
+
+@cocotb.test(skip=os.getenv("STREAM_WR_BUF_BEATS", "8") != "16")
+async def test_stream_wr_buf_beats_16(dut):
+    """Configured INCR16 cache-line write streams before AHB completion."""
+    await _check_configured_stream_write(dut, 16)
+
+
+@cocotb.test()
+async def test_incr8_fixed_write_early_stop_pads_declared_axi_burst(dut):
+    """Early INCR8 termination must retain AWLEN=7 and zero-strobe pad W."""
+    set_test_id(dut)
+    await setup_dut_no_axi_slave(dut)
+
+    addr = 0x8001_0100
+    data0 = 0xA100_0000_0000_0001
+    data1 = 0xA100_0000_0000_0002
+    captured = {"awlen": None, "beats": []}
+
+    dut.m_axi_awready.value = 1
+    dut.m_axi_wready.value = 1
+    dut.m_axi_bvalid.value = 0
+    dut.m_axi_bresp.value = 0
+
+    async def axi_slave():
+        while True:
+            await RisingEdge(dut.clk)
+            await ReadOnly()
+            if int(dut.m_axi_awvalid.value) and int(dut.m_axi_awready.value):
+                captured["awlen"] = int(dut.m_axi_awlen.value)
+                break
+
+        while True:
+            await RisingEdge(dut.clk)
+            await ReadOnly()
+            if int(dut.m_axi_wvalid.value) and int(dut.m_axi_wready.value):
+                captured["beats"].append((
+                    int(dut.m_axi_wdata.value),
+                    int(dut.m_axi_wstrb.value),
+                    int(dut.m_axi_wlast.value),
+                ))
+                if int(dut.m_axi_wlast.value):
+                    break
+
+        await NextTimeStep()
+        dut.m_axi_bvalid.value = 1
+        while True:
+            await RisingEdge(dut.clk)
+            if int(dut.m_axi_bvalid.value) and int(dut.m_axi_bready.value):
+                break
+        dut.m_axi_bvalid.value = 0
+
+    async def ahb_two_beats_then_deselect():
+        dut.hsel.value = 1
+        dut.hreadyin.value = 1
+        dut.haddr.value = addr
+        dut.hburst.value = 0b101  # INCR8
+        dut.hmastlock.value = 0
+        dut.hprot.value = 0b0011
+        dut.hsize.value = AHB_SIZE_8
+        dut.htrans.value = AHB_NONSEQ
+        dut.hwrite.value = 1
+        dut.hwdata.value = 0
+
+        await _wait_hready_high(dut)
+        dut.haddr.value = addr + 8
+        dut.htrans.value = AHB_SEQ
+        dut.hwdata.value = data0
+
+        await _wait_hready_high(dut)
+        dut.hsel.value = 0
+        dut.haddr.value = 0
+        dut.hburst.value = AHB_BURST_SINGLE
+        dut.hsize.value = 0
+        dut.htrans.value = AHB_IDLE
+        dut.hwrite.value = 0
+        dut.hwdata.value = data1
+
+        await _wait_hready_high(dut)
+        _init_direct_ahb_signals(dut)
+
+    slave_task = cocotb.start_soon(axi_slave())
+    await with_timeout(ahb_two_beats_then_deselect(), 30, "us")
+    await with_timeout(slave_task, 30, "us")
+
+    assert captured["awlen"] == 7, captured
+    assert captured["beats"] == [
+        (data0, 0xFF, 0),
+        (data1, 0xFF, 0),
+        *[(0, 0, int(i == 7)) for i in range(2, 8)],
+    ], captured
+
+
+@cocotb.test()
+async def test_streamed_incr8_idle_gap_followon_does_not_duplicate_wlast(dut):
+    """A follow-on NONSEQ must not switch a completed stream into replay mode."""
+    set_test_id(dut)
+    await setup_dut_no_axi_slave(dut)
+
+    # This regression samples the setup values immediately before each rising
+    # edge.  Disable the generic post-edge monitor, whose sampling convention
+    # is unsuitable when this test changes READY between adjacent cycles.
+    for task in _MONITOR_TASKS.pop(id(dut), []):
+        task.kill()
+
+    addr0 = 0x8004_2000
+    addr1 = 0x8004_1000
+    data0 = [0x5100_0000_0000_0000 | i for i in range(8)]
+
+    dut.m_axi_awready.value = 1
+    dut.m_axi_wready.value = 1
+    dut.m_axi_bvalid.value = 0
+    dut.m_axi_bresp.value = 0
+
+    fourth_w_seen = Event()
+    seventh_w_seen = Event()
+    eighth_w_seen = Event()
+    followon_presented = Event()
+    monitor_done = Event()
+
+    async def strict_axi_monitor():
+        aw_count = 0
+        first_w_count = 0
+
+        while not monitor_done.is_set():
+            await FallingEdge(dut.clk)
+            aw_fire = (int(dut.m_axi_awvalid.value) and
+                       int(dut.m_axi_awready.value))
+            awaddr = int(dut.m_axi_awaddr.value)
+            awlen = int(dut.m_axi_awlen.value)
+            w_fire = (int(dut.m_axi_wvalid.value) and
+                      int(dut.m_axi_wready.value))
+            wlast = int(dut.m_axi_wlast.value)
+            await RisingEdge(dut.clk)
+
+            if aw_fire:
+                aw_count += 1
+                if aw_count == 1:
+                    assert awaddr == addr0
+                    assert awlen == 7
+
+            if w_fire:
+                assert aw_count != 0, "accepted W without a preceding AW"
+                first_w_count += 1
+                assert first_w_count <= 8, (
+                    "streamed INCR8 emitted an extra W beat after its WLAST"
+                )
+                assert wlast == int(first_w_count == 8)
+
+                if first_w_count == 4:
+                    fourth_w_seen.set()
+                elif first_w_count == 7:
+                    seventh_w_seen.set()
+                elif first_w_count == 8:
+                    eighth_w_seen.set()
+
+    async def drive_trace_wready():
+        await fourth_w_seen.wait()
+        await NextTimeStep()
+        dut.m_axi_wready.value = 0
+        await ClockCycles(dut.clk, 2)
+        await NextTimeStep()
+        dut.m_axi_wready.value = 1
+
+        await seventh_w_seen.wait()
+        await NextTimeStep()
+        dut.m_axi_wready.value = 0
+        await followon_presented.wait()
+        dut.m_axi_wready.value = 1
+
+        await eighth_w_seen.wait()
+        await NextTimeStep()
+        dut.m_axi_wready.value = 0
+        await ClockCycles(dut.clk, 2)
+        await NextTimeStep()
+        dut.m_axi_wready.value = 1
+
+        # A correct bridge has retired WVALID while waiting for B.  The broken
+        # bridge replays WLAST when WREADY returns.
+        await ClockCycles(dut.clk, 4)
+        monitor_done.set()
+
+    monitor_task = cocotb.start_soon(strict_axi_monitor())
+    ready_task = cocotb.start_soon(drive_trace_wready())
+
+    await ahb_write_inc_burst_manual_with_hprot(
+        dut, addr0, data0, size_bytes=8, fixed=True, hprot=0b0011
+    )
+
+    await with_timeout(seventh_w_seen.wait(), 20, "us")
+
+    # The trace contains an IDLE gap before the next cache-line NONSEQ.
+    await NextTimeStep()
+    _init_direct_ahb_signals(dut)
+    await ClockCycles(dut.clk, 2)
+    dut.hsel.value = 1
+    dut.hreadyin.value = 1
+    dut.haddr.value = addr1
+    dut.hburst.value = 0b101
+    dut.hprot.value = 0b0011
+    dut.hsize.value = AHB_SIZE_8
+    dut.htrans.value = AHB_NONSEQ
+    dut.hwrite.value = 1
+    dut.hwdata.value = 0
+    followon_presented.set()
+
+    await with_timeout(ready_task, 20, "us")
+    await with_timeout(monitor_task, 20, "us")

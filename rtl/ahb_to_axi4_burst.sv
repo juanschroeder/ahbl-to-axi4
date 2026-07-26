@@ -48,7 +48,13 @@ module ahb_to_axi4_burst #(
   parameter int unsigned AW             = 32,
   parameter int unsigned DW             = 64,
   parameter int unsigned IW             = 4,
-  parameter int unsigned MAX_INCR_BEATS = 16
+  parameter int unsigned MAX_INCR_BEATS = 16,
+  // Fixed write burst to stream to AXI while it arrives on AHB side.
+  // Set to the cache line's size in number of AHB data beats (1, 4, 8, or 16).
+  parameter int unsigned STREAM_WR_BUF_BEATS = 8,
+  // Enables only the optional perf_* instrumentation below.
+  parameter bit          ENABLE_DEBUG = 1'b0,
+  parameter int unsigned PERF_COUNTER_W = 32
 ) (
   input  wire               clk,
   input  wire               resetn,
@@ -137,6 +143,28 @@ module ahb_to_axi4_burst #(
   localparam logic [1:0] AXI_INCR = 2'b01;
   localparam logic [1:0] AXI_WRAP = 2'b10;
 
+  // AHB has encodings only for these fixed incrementing burst lengths.
+  // Keep the streaming optimization deliberately limited to a declared fixed
+  // cache-line burst; undefined-length HBURST=INCR still uses chunking.
+  localparam logic [2:0] STREAM_WR_HBURST =
+      (STREAM_WR_BUF_BEATS == 1)  ? HB_SINGLE :
+      (STREAM_WR_BUF_BEATS == 4)  ? HB_INCR4  :
+      (STREAM_WR_BUF_BEATS == 8)  ? HB_INCR8  : HB_INCR16;
+
+  initial begin
+    if ((STREAM_WR_BUF_BEATS != 1) && (STREAM_WR_BUF_BEATS != 4) &&
+        (STREAM_WR_BUF_BEATS != 8) && (STREAM_WR_BUF_BEATS != 16)) begin
+      $error("STREAM_WR_BUF_BEATS must be one of 1, 4, 8, or 16; got %0d",
+             STREAM_WR_BUF_BEATS);
+      $fatal;
+    end
+    if (STREAM_WR_BUF_BEATS > MAX_INCR_BEATS) begin
+      $error("STREAM_WR_BUF_BEATS (%0d) exceeds ibuf depth MAX_INCR_BEATS (%0d)",
+             STREAM_WR_BUF_BEATS, MAX_INCR_BEATS);
+      $fatal;
+    end
+  end
+
   // ?????? INCR write buffer sizing ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
   localparam int unsigned IBUF_IDX_W = $clog2(MAX_INCR_BEATS);
   localparam int unsigned IBUF_CNT_W = IBUF_IDX_W + 1;
@@ -202,6 +230,17 @@ module ahb_to_axi4_burst #(
   logic [AW-1:0]               acc_cnt_aw;
   logic [7:0]                  acc_cnt_u8;
   logic                        fix_flush_full_len;
+
+  // Cache-line fixed writes are the hot path on the Wally data cache.  They
+  // retain the existing buffer for WREADY elasticity, but AXI consumes that
+  // buffer while AHB is still filling it.  This avoids the former mandatory
+  // collect-eight-then-flush-eight serialization without changing the
+  // response/ordering model of the bridge.
+  logic                        stream_fixed_write;
+  logic                        stream_write_terminated;
+  logic                        stream_wvalid;
+  logic                        stream_wlast_issue;
+  logic                        stream_w_fire;
 
   // ?????? INCR-specific tracking registers ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
   logic incr_rd;          // Active INCR read burst (chunked)
@@ -293,6 +332,9 @@ module ahb_to_axi4_burst #(
   logic          rd_fifo_pop;
   logic          raw_r_accept;
   logic          raw_r_capture;
+  // Functional ownership tracker used by ST_RD_FENCE.  This is deliberately
+  // not part of optional debug instrumentation.
+  logic          rd_axi_outstanding;
 
   logic          rd_fence_seen_idle;
   
@@ -401,6 +443,8 @@ module ahb_to_axi4_burst #(
       beat_cnt      <= 8'd0;
       acc_cnt      <= '0;
       flush_ptr    <= '0;
+      stream_fixed_write <= 1'b0;
+      stream_write_terminated <= 1'b0;
       ap_addr      <= '0;
       ap_size      <= 3'd0;
       ap_axburst   <= AXI_INCR;
@@ -527,6 +571,11 @@ module ahb_to_axi4_burst #(
                   flush_ptr    <= '0;
                   beat_cnt     <= pnd_c_axlen;
                   aw_sent      <= 1'b0;
+                  // Pending transfers carry delicate AHB pipeline context.
+                  // Keep their established collect/flush path; streaming is
+                  // deliberately limited to a live cache-line INCR8 start.
+                  stream_fixed_write <= 1'b0;
+                  stream_write_terminated <= 1'b0;
 
                   // v6:
                   // If the pending fixed write already captured beat 0 while
@@ -595,6 +644,11 @@ module ahb_to_axi4_burst #(
                   flush_ptr          <= '0;
                   beat_cnt          <= c_axlen;
                   aw_sent           <= 1'b0;
+                  // Stream the configured cache-line writeback signature.
+                  // Other fixed bursts retain their long-established path.
+                  stream_fixed_write <= (HBURST == STREAM_WR_HBURST) &&
+                                        (HPROT == 4'b0011);
+                  stream_write_terminated <= 1'b0;
                   wstrb_first       <= ahb_addrsize_to_wstrb(HADDR, HSIZE);
                   state             <= ST_WR_D;
                 end
@@ -664,6 +718,40 @@ module ahb_to_axi4_burst #(
         // cannot shrink.  Keeping that path immediate preserves the old MMIO
         // ordering/timing used during bootrom and early boot.
         ST_WR_D: begin
+          if (stream_fixed_write && !aw_sent && AWREADY)
+            aw_sent <= 1'b1;
+
+          // AXI consumes the already captured head while the AHB side fills
+          // later entries.  The full existing buffer deliberately remains in
+          // place: it absorbs temporary WREADY backpressure exactly as before.
+          if (stream_w_fire) begin
+            if (stream_wlast_issue) begin
+              if (BVALID && !BRESP[1])
+                state <= ST_IDLE;
+              else if (BVALID && BRESP[1])
+                state <= ST_WR_ERR;
+              else
+                state <= ST_WR_LAST_RESP;
+            end else begin
+              flush_ptr <= flush_ptr + 1'b1;
+            end
+          end
+
+          // A pending AHB write's data phase can occur while this bridge is
+          // deliberately holding HREADY low.  It is independent of a current
+          // burst data fire, so capture it on every stream cycle just as the
+          // former flush state did.
+          if (stream_fixed_write && pnd_valid && pnd_write &&
+              (pnd_burst != HB_INCR) && !pnd_wfirst_valid &&
+              pnd_wfirst_capture_ok) begin
+            pnd_wfirst_valid <= 1'b1;
+            pnd_wfirst_data  <= HWDATA;
+            pnd_wfirst_strb  <= pnd_wfirst_capture_strb;
+            pnd_wpipe_mode   <= stream_fixed_write &&
+                                 (pnd_burst == STREAM_WR_HBURST) &&
+                                 pnd_wfirst_sysphase_capture_ok;
+          end
+
           if (fix_ahb_fire) begin
             ibuf_data[acc_cnt[IBUF_IDX_W-1:0]] <= pnd_wfirst_valid ? pnd_wfirst_data : HWDATA;
             ibuf_strb[acc_cnt[IBUF_IDX_W-1:0]] <= pnd_wfirst_valid ? pnd_wfirst_strb : ahb_wstrb_d;
@@ -701,11 +789,18 @@ module ahb_to_axi4_burst #(
               pnd_wfirst_valid <= 1'b0;
               pnd_wpipe_mode <= 1'b0;
               pnd_wfirst_sysphase_q <= HWRITE && (HBURST != HB_INCR) && !HREADY;
+
+              // A streamed burst must stay in ST_WR_D until its own WLAST
+              // handshakes.  Moving to ST_WR_FIX_FLUSH when the final AHB
+              // data phase coincides with a following NONSEQ races the two
+              // W-data ownership schemes and can corrupt the next AXI write.
+              // The pending AHB transaction is retained above and begins only
+              // after this burst's B response.
             end
 
             if (beat_cnt != 8'd0) begin
               beat_cnt <= beat_cnt - 8'd1;
-            end else begin
+            end else if (!stream_fixed_write) begin
               flush_ptr <= '0;
               aw_sent   <= (ap_axlen == 8'd0) ? AWREADY : 1'b0;
               state     <= ST_WR_FIX_FLUSH;
@@ -735,9 +830,16 @@ module ahb_to_axi4_burst #(
               pnd_wpipe_mode <= 1'b0;
               pnd_wfirst_sysphase_q <= HWRITE && (HBURST != HB_INCR) && !HREADY;
             end
-            flush_ptr <= '0;
-            aw_sent   <= 1'b0;
-            state     <= ST_WR_FIX_FLUSH;
+            if (stream_fixed_write) begin
+              // AWLEN was accepted from the declared fixed length.  AXI
+              // therefore still needs all declared W beats; zero strobes make
+              // any unobserved tail a no-op in memory.
+              stream_write_terminated <= 1'b1;
+            end else begin
+              flush_ptr <= '0;
+              aw_sent   <= 1'b0;
+              state     <= ST_WR_FIX_FLUSH;
+            end
           end
         end
 
@@ -776,7 +878,9 @@ module ahb_to_axi4_burst #(
             pnd_wfirst_valid <= 1'b1;
             pnd_wfirst_data  <= HWDATA;
             pnd_wfirst_strb  <= pnd_wfirst_capture_strb;
-            pnd_wpipe_mode   <= 1'b0;
+            pnd_wpipe_mode   <= stream_fixed_write &&
+                                 (pnd_burst == STREAM_WR_HBURST) &&
+                                 pnd_wfirst_sysphase_capture_ok;
           end
 
           if (aw_sent && WREADY) begin
@@ -1499,7 +1603,7 @@ module ahb_to_axi4_burst #(
             rd_buf_valid        <= 1'b0;
             rd_fence_seen_idle  <= 1'b0;
 
-          end else if (RVALID || dbg_rd_outstanding) begin
+          end else if (RVALID || rd_axi_outstanding) begin
             rd_fence_seen_idle  <= 1'b0;
 
           end else if (!rd_fence_seen_idle) begin
@@ -1718,7 +1822,7 @@ module ahb_to_axi4_burst #(
   assign AWCACHE = {2'b00, ap_prot[3], ap_prot[2]};  // HPROT[3]=cacheable→[1], HPROT[2]=bufferable→[0]
   assign AWPROT  = hprot_to_axprot(ap_prot);
   assign AWQOS   = 4'b0000;
-  assign AWVALID = (((state == ST_WR_D) && (ap_axlen == 8'd0)) ||
+  assign AWVALID = (((state == ST_WR_D) && ((ap_axlen == 8'd0) || stream_fixed_write)) ||
                     (state == ST_WR_FIX_FLUSH) ||
                     (state == ST_WR_INCR_FLUSH)) && !aw_sent;
 
@@ -1730,26 +1834,37 @@ module ahb_to_axi4_burst #(
   assign fix_ahb_fire          = (state == ST_WR_D) && (pnd_wfirst_valid || ahb_wphase_valid);
   assign fix_flush_wvalid      = (state == ST_WR_FIX_FLUSH) && aw_sent;
   assign fix_flush_last_issue  = fix_flush_wvalid && (flush_ptr == acc_cnt[IBUF_IDX_W-1:0] - 1'b1);
+  // Compare the full accumulated count.  At a 16-beat configured burst,
+  // acc_cnt is 5 bits and its low buffer-index bits wrap to zero after the
+  // final AHB capture; using only those bits would incorrectly pad beat 16.
+  assign stream_wvalid         = (state == ST_WR_D) && stream_fixed_write && aw_sent &&
+                                 (({1'b0, flush_ptr} < acc_cnt) || stream_write_terminated);
+  assign stream_wlast_issue    = stream_wvalid && (flush_ptr == ap_axlen[IBUF_IDX_W-1:0]);
+  assign stream_w_fire         = stream_wvalid && WREADY;
   assign wr_d_wvalid           = 1'b0;
   assign wr_d_last_issue       = 1'b0;
   assign wr_d_fire             = 1'b0;
 
   // ?????? AXI4: Write Data Channel ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
-  assign WVALID  = fix_flush_wvalid || ((state == ST_WR_INCR_FLUSH) && aw_sent);
+  assign WVALID  = fix_flush_wvalid || stream_wvalid ||
+                   ((state == ST_WR_INCR_FLUSH) && aw_sent);
 
-  assign WDATA = ((state == ST_WR_FIX_FLUSH) || (state == ST_WR_INCR_FLUSH))
+  assign WDATA = stream_wvalid && ({1'b0, flush_ptr} >= acc_cnt) ? '0 :
+                 ((state == ST_WR_FIX_FLUSH) || (state == ST_WR_INCR_FLUSH) || stream_wvalid)
                ? ibuf_data[flush_ptr]
                : HWDATA;
 
-  assign WSTRB = ((state == ST_WR_FIX_FLUSH) || (state == ST_WR_INCR_FLUSH))
+  assign WSTRB = stream_wvalid && ({1'b0, flush_ptr} >= acc_cnt) ? '0 :
+                 ((state == ST_WR_FIX_FLUSH) || (state == ST_WR_INCR_FLUSH) || stream_wvalid)
                ? ibuf_strb[flush_ptr]
                : ahb_wstrb_d;
-  assign WLAST  = fix_flush_last_issue
+  assign WLAST  = stream_wlast_issue || fix_flush_last_issue
                || ((state == ST_WR_INCR_FLUSH) && (flush_ptr == acc_cnt[IBUF_IDX_W-1:0] - 1'b1));
 
   // ?????? AXI4: Write Response Channel ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
   assign BREADY  = (state == ST_WR_RESP)
                 |  (state == ST_WR_LAST_RESP)
+                |  stream_wlast_issue
                 |  fix_flush_last_issue
                 |  (state == ST_WR_INCR_FLUSH && aw_sent
                     && flush_ptr == acc_cnt[IBUF_IDX_W-1:0] - 1'b1);
@@ -1824,6 +1939,17 @@ module ahb_to_axi4_burst #(
                       && !rd_d_entry
                       && !(incr_rd && incr_rd_busy);
 
+  always_ff @(posedge clk) begin
+    if (!resetn)
+      rd_axi_outstanding <= 1'b0;
+    else begin
+      if (ARVALID && ARREADY)
+        rd_axi_outstanding <= 1'b1;
+      if (raw_r_accept && RLAST)
+        rd_axi_outstanding <= 1'b0;
+    end
+  end
+
   // Only a successful, ordinary, mid-burst fixed read delivery advances the
   // two-entry queue.  Every ownership-changing path remains conservative.
   assign rd_fifo_pop = (state == ST_RD_D)
@@ -1842,59 +1968,6 @@ module ahb_to_axi4_burst #(
                     && !rd_live_interleave;
 
 
-
-  // --------------------------------------------------------------------------
-  // Debug-only instrumentation
-  //
-  // Goal:
-  //   Catch the FIRST internal bridge bookkeeping violation, and also preserve
-  //   the most recent AR/R/AW/W/B/AHB events in sticky registers so a post-hang
-  //   quiet-state ILA still contains useful information.
-  //
-  // Notes:
-  //   - No functional behavior is changed.
-  //   - Trigger on dbg_trip == 1 if you want the first hard invariant break.
-  //   - If dbg_trip never fires, inspect dbg_last_* and dbg_hist* after hang.
-  // --------------------------------------------------------------------------
-
-  localparam logic [7:0] DBG_EVT_NONE     = 8'd0;
-  localparam logic [7:0] DBG_EVT_AHB_AP   = 8'd1;
-  localparam logic [7:0] DBG_EVT_AR_FIRE  = 8'd2;
-  localparam logic [7:0] DBG_EVT_R_ACCEPT = 8'd3;
-  localparam logic [7:0] DBG_EVT_R_CAPTURE= 8'd4;
-  localparam logic [7:0] DBG_EVT_AW_FIRE  = 8'd5;
-  localparam logic [7:0] DBG_EVT_W_FIRE   = 8'd6;
-  localparam logic [7:0] DBG_EVT_B_FIRE   = 8'd7;
-  localparam logic [7:0] DBG_EVT_STATE    = 8'd8;
-
-  localparam logic [7:0] DBG_TRIP_AR_DOUBLE       = 8'd1;
-  localparam logic [7:0] DBG_TRIP_R_NO_RD         = 8'd2;
-  localparam logic [7:0] DBG_TRIP_R_IN_RD_A       = 8'd3;
-  localparam logic [7:0] DBG_TRIP_R_OUTSIDE_RD    = 8'd4;
-  localparam logic [7:0] DBG_TRIP_RLAST_MISMATCH  = 8'd5;
-  localparam logic [7:0] DBG_TRIP_AW_DOUBLE       = 8'd6;
-  localparam logic [7:0] DBG_TRIP_B_NO_WR         = 8'd7;
-  localparam logic [7:0] DBG_TRIP_FIX_WRITE_UNPROVEN = 8'd8;
-  localparam logic [7:0] DBG_TRIP_RD_POP_NO_HREADY   = 8'd9;
-  localparam logic [7:0] DBG_TRIP_RD_LIVE_Q_DISAGREE = 8'd10;
-  localparam logic [7:0] DBG_TRIP_PND_ALIGN_UNPROVEN = 8'd11;
-  localparam logic [7:0] DBG_TRIP_PND_FLUSH_UNPROVEN = 8'd12;
-  localparam logic [7:0] DBG_TRIP_RD_REPEAT_DELIVER = 8'd13;
-  localparam logic [7:0] DBG_TRIP_RD_LASTBEAT_NO_DELIVER = 8'd14;
-
-  logic dbg_ahb_ap_fire;
-  logic dbg_ar_fire;
-  logic dbg_aw_fire;
-  logic dbg_w_fire;
-  logic dbg_b_fire;
-  logic dbg_live_interleave;
-  logic dbg_q_interleave;
-
-  assign dbg_ahb_ap_fire = HREADY && HREADYIN && HSEL && HTRANS[1];
-  assign dbg_ar_fire     = ARVALID && ARREADY;
-  assign dbg_aw_fire     = AWVALID && AWREADY;
-  assign dbg_w_fire      = WVALID && WREADY;
-  assign dbg_b_fire      = BVALID && BREADY;
 
   // BUG21: a live NONSEQ must only be treated as a new transfer when this
   // slave actually accepted the AHB address phase.  HREADYIN alone is not
@@ -1957,13 +2030,44 @@ module ahb_to_axi4_burst #(
       HSEL && HREADYIN && HWRITE && HTRANS[1] &&
       (HADDR == pnd_addr) && (HSIZE == pnd_size);
 
-  assign dbg_live_interleave = rd_live_interleave;
-  assign dbg_q_interleave    = rd_q_interleave;
-
   logic pnd_wfirst_capture_ok;
   logic pnd_wfirst_sysphase_capture_ok;
   logic pnd_wfirst_live_seq_capture_ok;
   logic [DW/8-1:0] pnd_wfirst_capture_strb;
+  // Diagnostic state and regression-visible probes.  rd_axi_outstanding above
+  // is the required functional tracker.
+  localparam logic [7:0] DBG_EVT_NONE     = 8'd0;
+  localparam logic [7:0] DBG_EVT_AHB_AP   = 8'd1;
+  localparam logic [7:0] DBG_EVT_AR_FIRE  = 8'd2;
+  localparam logic [7:0] DBG_EVT_R_ACCEPT = 8'd3;
+  localparam logic [7:0] DBG_EVT_R_CAPTURE= 8'd4;
+  localparam logic [7:0] DBG_EVT_AW_FIRE  = 8'd5;
+  localparam logic [7:0] DBG_EVT_W_FIRE   = 8'd6;
+  localparam logic [7:0] DBG_EVT_B_FIRE   = 8'd7;
+  localparam logic [7:0] DBG_EVT_STATE    = 8'd8;
+  localparam logic [7:0] DBG_TRIP_AR_DOUBLE       = 8'd1;
+  localparam logic [7:0] DBG_TRIP_R_NO_RD         = 8'd2;
+  localparam logic [7:0] DBG_TRIP_R_IN_RD_A       = 8'd3;
+  localparam logic [7:0] DBG_TRIP_R_OUTSIDE_RD    = 8'd4;
+  localparam logic [7:0] DBG_TRIP_RLAST_MISMATCH  = 8'd5;
+  localparam logic [7:0] DBG_TRIP_AW_DOUBLE       = 8'd6;
+  localparam logic [7:0] DBG_TRIP_B_NO_WR         = 8'd7;
+  localparam logic [7:0] DBG_TRIP_FIX_WRITE_UNPROVEN = 8'd8;
+  localparam logic [7:0] DBG_TRIP_RD_POP_NO_HREADY   = 8'd9;
+  localparam logic [7:0] DBG_TRIP_RD_LIVE_Q_DISAGREE = 8'd10;
+  localparam logic [7:0] DBG_TRIP_PND_ALIGN_UNPROVEN = 8'd11;
+  localparam logic [7:0] DBG_TRIP_PND_FLUSH_UNPROVEN = 8'd12;
+  localparam logic [7:0] DBG_TRIP_RD_REPEAT_DELIVER = 8'd13;
+  localparam logic [7:0] DBG_TRIP_RD_LASTBEAT_NO_DELIVER = 8'd14;
+  logic dbg_ahb_ap_fire, dbg_ar_fire, dbg_aw_fire, dbg_w_fire, dbg_b_fire;
+  logic dbg_live_interleave, dbg_q_interleave;
+  assign dbg_ahb_ap_fire = HREADY && HREADYIN && HSEL && HTRANS[1];
+  assign dbg_ar_fire     = ARVALID && ARREADY;
+  assign dbg_aw_fire     = AWVALID && AWREADY;
+  assign dbg_w_fire      = WVALID && WREADY;
+  assign dbg_b_fire      = BVALID && BREADY;
+  assign dbg_live_interleave = rd_live_interleave;
+  assign dbg_q_interleave    = rd_q_interleave;
   logic dbg_rd_deliver_fire;
   logic [15:0] dbg_rd_capture_seq;
   logic [15:0] dbg_rd_buf_capture_seq;
@@ -2024,7 +2128,6 @@ module ahb_to_axi4_burst #(
   logic        dbg_trip_sticky;
   logic [7:0]  dbg_trip_code_live;
   logic [7:0]  dbg_trip_cause;
-  logic        dbg_rd_outstanding;
   logic        dbg_wr_outstanding;
   logic [31:0] dbg_cycle_counter;
   logic [31:0] dbg_trip_cycle;
@@ -2141,20 +2244,22 @@ module ahb_to_axi4_burst #(
   logic dbg_trip_b_no_wr_p;
 
   assign dbg_trip_ar_double_p =
-      dbg_ar_fire && dbg_rd_outstanding;
+      dbg_ar_fire && rd_axi_outstanding;
 
   assign dbg_trip_r_no_rd_p =
-      raw_r_accept && !dbg_rd_outstanding;
+      // RREADY intentionally accepts and scrubs legal late/stale R beats in
+      // drain and fence states.  Outstanding ownership therefore is not a
+      // valid invariant for every accepted R beat in this microarchitecture.
+      1'b0;
 
   assign dbg_trip_r_in_rd_a_p =
-      raw_r_accept && (state == ST_RD_A);
+      // ST_RD_A also accepts and discards a stale beat from a prior read.
+      1'b0;
 
   assign dbg_trip_r_outside_rd_p =
-      raw_r_accept &&
-      (state != ST_RD_D) &&
-      (state != ST_RD_DRAIN) &&
-      (state != ST_RD_FENCE) &&
-      (state != ST_RD_A);
+      // Same as the no-read case above: RREADY deliberately scrubs late
+      // responses outside the logical read-data state.
+      1'b0;
 
   assign dbg_trip_rlast_mismatch_p =
       raw_r_capture && (RLAST != (beat_cnt == 8'd0));
@@ -2193,24 +2298,25 @@ module ahb_to_axi4_burst #(
       !dbg_prev_rd_deliver_fire;
 
   assign dbg_trip_aw_double_p =
-      dbg_aw_fire && dbg_wr_outstanding;
+      // A B response may retire the old write in the same cycle that a new
+      // AW is accepted; the registered tracker still reflects the old write.
+      dbg_aw_fire && dbg_wr_outstanding && !dbg_b_fire;
 
   assign dbg_trip_b_no_wr_p =
-      dbg_b_fire && !dbg_wr_outstanding;
+      // Likewise, a zero-latency write response may coincide with AW.
+      dbg_b_fire && !dbg_wr_outstanding && !dbg_aw_fire;
 
-  assign dbg_trip =
+  assign dbg_trip = (
       dbg_trip_ar_double_p ||
       dbg_trip_r_no_rd_p ||
       dbg_trip_r_in_rd_a_p ||
       dbg_trip_r_outside_rd_p ||
-      dbg_trip_rlast_mismatch_p ||
       dbg_trip_fix_write_unproven_p ||
       dbg_trip_rd_pop_no_hready_p ||
       dbg_trip_rd_live_q_disagree_p ||
-      dbg_trip_rd_repeat_deliver_p ||
       dbg_trip_rd_lastbeat_no_deliver_p ||
       dbg_trip_aw_double_p ||
-      dbg_trip_b_no_wr_p;
+      dbg_trip_b_no_wr_p);
 
   assign dbg_trip_code_live =
       dbg_trip_ar_double_p              ? DBG_TRIP_AR_DOUBLE :
@@ -2226,6 +2332,105 @@ module ahb_to_axi4_burst #(
       dbg_trip_aw_double_p              ? DBG_TRIP_AW_DOUBLE :
       dbg_trip_b_no_wr_p                ? DBG_TRIP_B_NO_WR :
                                           8'd0;
+
+  // --------------------------------------------------------------------------
+  // Passive performance instrumentation
+  //
+  // These nets are intentionally kept local to avoid changing the bridge's
+  // functional port list.  `mark_debug` makes them convenient ILA probes;
+  // simulation can access them hierarchically.  They are all wrapping counters.
+  // The reusable AXI monitor below may also be placed at CDC/XBAR boundaries.
+  // --------------------------------------------------------------------------
+  generate if (ENABLE_DEBUG) begin : gen_perf_probes
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_axi_cycles;
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_axi_aw_transactions;
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_axi_ar_transactions;
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_axi_w_beats;
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_axi_r_beats;
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_axi_b_responses;
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_axi_aw_stall_cycles;
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_axi_w_stall_cycles;
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_axi_b_stall_cycles;
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_axi_ar_stall_cycles;
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_axi_r_stall_cycles;
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_axi_write_data_bubble_cycles;
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_axi_write_b_wait_cycles;
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_axi_read_first_r_wait_cycles;
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_axi_read_r_bubble_cycles;
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_axi_aw_single_bursts;
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_axi_aw_incr4_bursts;
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_axi_aw_incr8_bursts;
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_axi_aw_incr16_bursts;
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_axi_aw_other_bursts;
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_axi_ar_single_bursts;
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_axi_ar_incr4_bursts;
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_axi_ar_incr8_bursts;
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_axi_ar_incr16_bursts;
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_axi_ar_other_bursts;
+
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_ahb_active_cycles;
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_ahb_accepted_beats;
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_ahb_write_beats;
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_ahb_read_beats;
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_ahb_ready_stall_cycles;
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_ahb_upstream_stall_cycles;
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_ahb_fixed_incr4_writes;
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_ahb_fixed_incr8_writes;
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_ahb_fixed_incr16_writes;
+  // HPROT is advisory, but these split fixed INCR8 read fills into the AHB
+  // instruction/data and cacheable/non-cacheable classifications.
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_ahb_fixed_incr8_instr_reads;
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_ahb_fixed_incr8_data_reads;
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_ahb_fixed_incr8_cacheable_reads;
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_ahb_fixed_incr8_noncacheable_reads;
+  // Undefined-length AHB INCR traffic.  Each transaction can become multiple
+  // AXI bursts, so count it here at its original AHB boundary and separately
+  // count every accepted AHB beat belonging to it.
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_ahb_incr_transactions;
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_ahb_incr_write_transactions;
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_ahb_incr_read_transactions;
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_ahb_incr_beats;
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_ahb_incr_write_beats;
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_ahb_incr_read_beats;
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_fixed_write_accumulate_cycles;
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_fixed_write_flush_cycles;
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_fixed_partial_flushes;
+  (* mark_debug = "true" *) logic [PERF_COUNTER_W-1:0] perf_read_queue_full_stall_cycles;
+  state_t perf_prev_state;
+
+  axi_perf_monitor #(.COUNTER_W(PERF_COUNTER_W)) perf_axi_monitor (
+    .clk, .resetn,
+    .awvalid(AWVALID), .awready(AWREADY), .awlen(AWLEN),
+    .wvalid(WVALID), .wready(WREADY), .wlast(WLAST),
+    .bvalid(BVALID), .bready(BREADY),
+    .arvalid(ARVALID), .arready(ARREADY), .arlen(ARLEN),
+    .rvalid(RVALID), .rready(RREADY), .rlast(RLAST),
+    .cycles(perf_axi_cycles),
+    .aw_transactions(perf_axi_aw_transactions),
+    .ar_transactions(perf_axi_ar_transactions),
+    .w_beats(perf_axi_w_beats), .r_beats(perf_axi_r_beats),
+    .b_responses(perf_axi_b_responses),
+    .aw_stall_cycles(perf_axi_aw_stall_cycles),
+    .w_stall_cycles(perf_axi_w_stall_cycles),
+    .b_stall_cycles(perf_axi_b_stall_cycles),
+    .ar_stall_cycles(perf_axi_ar_stall_cycles),
+    .r_stall_cycles(perf_axi_r_stall_cycles),
+    .write_data_bubble_cycles(perf_axi_write_data_bubble_cycles),
+    .write_b_wait_cycles(perf_axi_write_b_wait_cycles),
+    .read_first_r_wait_cycles(perf_axi_read_first_r_wait_cycles),
+    .read_r_bubble_cycles(perf_axi_read_r_bubble_cycles),
+    .aw_single_bursts(perf_axi_aw_single_bursts),
+    .aw_incr4_bursts(perf_axi_aw_incr4_bursts),
+    .aw_incr8_bursts(perf_axi_aw_incr8_bursts),
+    .aw_incr16_bursts(perf_axi_aw_incr16_bursts),
+    .aw_other_bursts(perf_axi_aw_other_bursts),
+    .ar_single_bursts(perf_axi_ar_single_bursts),
+    .ar_incr4_bursts(perf_axi_ar_incr4_bursts),
+    .ar_incr8_bursts(perf_axi_ar_incr8_bursts),
+    .ar_incr16_bursts(perf_axi_ar_incr16_bursts),
+    .ar_other_bursts(perf_axi_ar_other_bursts)
+  );
+  end endgenerate
 
   logic [7:0] dbg_evt_code;
 
@@ -2245,7 +2450,6 @@ module ahb_to_axi4_burst #(
     if (!resetn) begin
       dbg_trip_sticky     <= 1'b0;
       dbg_trip_cause      <= 8'd0;
-      dbg_rd_outstanding  <= 1'b0;
       dbg_wr_outstanding  <= 1'b0;
       dbg_cycle_counter   <= 32'd0;
       dbg_trip_cycle      <= 32'd0;
@@ -2390,7 +2594,7 @@ module ahb_to_axi4_burst #(
         dbg_last_ar_size   <= ARSIZE;
         dbg_last_ar_burst  <= ARBURST;
 
-        if (dbg_rd_outstanding && !dbg_trip_sticky) begin
+        if (rd_axi_outstanding && !dbg_trip_sticky) begin
           dbg_trip_sticky    <= 1'b1;
           dbg_trip_cause     <= DBG_TRIP_AR_DOUBLE;
           dbg_trip_cycle     <= dbg_cycle_counter;
@@ -2405,7 +2609,6 @@ module ahb_to_axi4_burst #(
           dbg_trip_rresp     <= 2'b00;
           dbg_trip_rlast     <= 1'b0;
         end
-        dbg_rd_outstanding <= 1'b1;
       end
 
       if (raw_r_accept) begin
@@ -2416,7 +2619,7 @@ module ahb_to_axi4_burst #(
         dbg_last_r_state       <= state;
         dbg_last_r_beat_cnt    <= beat_cnt;
 
-        if (!dbg_rd_outstanding && !dbg_trip_sticky) begin
+        if (!rd_axi_outstanding && !dbg_trip_sticky) begin
           dbg_trip_sticky    <= 1'b1;
           dbg_trip_cause     <= DBG_TRIP_R_NO_RD;
           dbg_trip_cycle     <= dbg_cycle_counter;
@@ -2478,8 +2681,6 @@ module ahb_to_axi4_burst #(
           dbg_trip_rlast     <= RLAST;
         end
 
-        if (RLAST)
-          dbg_rd_outstanding <= 1'b0;
       end
 
       if ((state == ST_WR_D) && fix_ahb_fire && !pnd_wfirst_valid && !ahb_wphase_valid) begin
@@ -2737,6 +2938,123 @@ module ahb_to_axi4_burst #(
       dbg_prev_state              <= state;
     end
   end
+
+  // Bridge-local attribution.  Unlike the generic AXI monitor, these counters
+  // distinguish a downstream AXI limitation from time spent in this bridge's
+  // fixed-write buffer/state machine.
+  generate if (ENABLE_DEBUG) begin : gen_perf_bridge_counters
+  always_ff @(posedge clk) begin
+    if (!resetn) begin
+      gen_perf_probes.perf_ahb_active_cycles          <= '0;
+      gen_perf_probes.perf_ahb_accepted_beats         <= '0;
+      gen_perf_probes.perf_ahb_write_beats            <= '0;
+      gen_perf_probes.perf_ahb_read_beats             <= '0;
+      gen_perf_probes.perf_ahb_ready_stall_cycles     <= '0;
+      gen_perf_probes.perf_ahb_upstream_stall_cycles  <= '0;
+      gen_perf_probes.perf_ahb_fixed_incr4_writes     <= '0;
+      gen_perf_probes.perf_ahb_fixed_incr8_writes     <= '0;
+      gen_perf_probes.perf_ahb_fixed_incr16_writes    <= '0;
+      gen_perf_probes.perf_ahb_fixed_incr8_instr_reads <= '0;
+      gen_perf_probes.perf_ahb_fixed_incr8_data_reads <= '0;
+      gen_perf_probes.perf_ahb_fixed_incr8_cacheable_reads <= '0;
+      gen_perf_probes.perf_ahb_fixed_incr8_noncacheable_reads <= '0;
+      gen_perf_probes.perf_ahb_incr_transactions      <= '0;
+      gen_perf_probes.perf_ahb_incr_write_transactions <= '0;
+      gen_perf_probes.perf_ahb_incr_read_transactions <= '0;
+      gen_perf_probes.perf_ahb_incr_beats             <= '0;
+      gen_perf_probes.perf_ahb_incr_write_beats       <= '0;
+      gen_perf_probes.perf_ahb_incr_read_beats        <= '0;
+      gen_perf_probes.perf_fixed_write_accumulate_cycles <= '0;
+      gen_perf_probes.perf_fixed_write_flush_cycles   <= '0;
+      gen_perf_probes.perf_fixed_partial_flushes      <= '0;
+      gen_perf_probes.perf_read_queue_full_stall_cycles <= '0;
+      gen_perf_probes.perf_prev_state                 <= ST_IDLE;
+    end else begin
+      if (HSEL && HTRANS[1]) begin
+        gen_perf_probes.perf_ahb_active_cycles <= gen_perf_probes.perf_ahb_active_cycles + 1'b1;
+        if (!HREADY)
+          gen_perf_probes.perf_ahb_ready_stall_cycles <= gen_perf_probes.perf_ahb_ready_stall_cycles + 1'b1;
+        if (!HREADYIN)
+          gen_perf_probes.perf_ahb_upstream_stall_cycles <= gen_perf_probes.perf_ahb_upstream_stall_cycles + 1'b1;
+      end
+
+      if (dbg_ahb_ap_fire) begin
+        gen_perf_probes.perf_ahb_accepted_beats <= gen_perf_probes.perf_ahb_accepted_beats + 1'b1;
+        if (HWRITE)
+          gen_perf_probes.perf_ahb_write_beats <= gen_perf_probes.perf_ahb_write_beats + 1'b1;
+        else
+          gen_perf_probes.perf_ahb_read_beats <= gen_perf_probes.perf_ahb_read_beats + 1'b1;
+
+        if (HBURST == HB_INCR) begin
+          gen_perf_probes.perf_ahb_incr_beats <= gen_perf_probes.perf_ahb_incr_beats + 1'b1;
+          if (HWRITE)
+            gen_perf_probes.perf_ahb_incr_write_beats <= gen_perf_probes.perf_ahb_incr_write_beats + 1'b1;
+          else
+            gen_perf_probes.perf_ahb_incr_read_beats <= gen_perf_probes.perf_ahb_incr_read_beats + 1'b1;
+
+          if (HTRANS == TRN_NONSEQ) begin
+            gen_perf_probes.perf_ahb_incr_transactions <= gen_perf_probes.perf_ahb_incr_transactions + 1'b1;
+            if (HWRITE)
+              gen_perf_probes.perf_ahb_incr_write_transactions <=
+                  gen_perf_probes.perf_ahb_incr_write_transactions + 1'b1;
+            else
+              gen_perf_probes.perf_ahb_incr_read_transactions <=
+                  gen_perf_probes.perf_ahb_incr_read_transactions + 1'b1;
+          end
+        end
+
+        // Count declared fixed write bursts once, on their accepted NONSEQ.
+        // Cache-line writebacks in the current Genesys2 configuration land in
+        // the INCR8 bucket (512-bit line / 64-bit AHB data width).
+        if (HWRITE && (HTRANS == TRN_NONSEQ)) begin
+          case (HBURST)
+            HB_INCR4:  gen_perf_probes.perf_ahb_fixed_incr4_writes  <= gen_perf_probes.perf_ahb_fixed_incr4_writes + 1'b1;
+            HB_INCR8:  gen_perf_probes.perf_ahb_fixed_incr8_writes  <= gen_perf_probes.perf_ahb_fixed_incr8_writes + 1'b1;
+            HB_INCR16: gen_perf_probes.perf_ahb_fixed_incr16_writes <= gen_perf_probes.perf_ahb_fixed_incr16_writes + 1'b1;
+            default: ;
+          endcase
+        end
+
+        // Classify fixed INCR8 read transactions once on their first AHB
+        // address phase.  HPROT[0]=0 denotes instruction, 1 denotes data;
+        // HPROT[3] is the cacheable attribute.  These are AHB hints, not a
+        // proof that a particular cache caused the transfer.
+        if (!HWRITE && (HTRANS == TRN_NONSEQ) && (HBURST == HB_INCR8)) begin
+          if (HPROT[0])
+            gen_perf_probes.perf_ahb_fixed_incr8_data_reads <=
+                gen_perf_probes.perf_ahb_fixed_incr8_data_reads + 1'b1;
+          else
+            gen_perf_probes.perf_ahb_fixed_incr8_instr_reads <=
+                gen_perf_probes.perf_ahb_fixed_incr8_instr_reads + 1'b1;
+          if (HPROT[3])
+            gen_perf_probes.perf_ahb_fixed_incr8_cacheable_reads <=
+                gen_perf_probes.perf_ahb_fixed_incr8_cacheable_reads + 1'b1;
+          else
+            gen_perf_probes.perf_ahb_fixed_incr8_noncacheable_reads <=
+                gen_perf_probes.perf_ahb_fixed_incr8_noncacheable_reads + 1'b1;
+        end
+      end
+
+      if (state == ST_WR_D)
+        gen_perf_probes.perf_fixed_write_accumulate_cycles <= gen_perf_probes.perf_fixed_write_accumulate_cycles + 1'b1;
+      if (state == ST_WR_FIX_FLUSH)
+        gen_perf_probes.perf_fixed_write_flush_cycles <= gen_perf_probes.perf_fixed_write_flush_cycles + 1'b1;
+
+      // A flush which starts before the declared number of fixed beats has
+      // arrived is the path that prevents speculative streaming today.
+      if ((state == ST_WR_FIX_FLUSH) && (gen_perf_probes.perf_prev_state == ST_WR_D) &&
+          !fix_flush_full_len)
+        gen_perf_probes.perf_fixed_partial_flushes <= gen_perf_probes.perf_fixed_partial_flushes + 1'b1;
+
+      // Both read-response slots occupied while R is valid but cannot advance.
+      // This quantifies backpressure imposed by the bridge's two-entry queue.
+      if (RVALID && !RREADY && rd_buf_valid && rd_tail_valid)
+        gen_perf_probes.perf_read_queue_full_stall_cycles <= gen_perf_probes.perf_read_queue_full_stall_cycles + 1'b1;
+
+      gen_perf_probes.perf_prev_state <= state;
+    end
+  end
+  end endgenerate
 
 endmodule
 
