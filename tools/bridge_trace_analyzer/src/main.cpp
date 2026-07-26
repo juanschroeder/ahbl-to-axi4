@@ -193,6 +193,10 @@ struct AxiBurstDesc {
     std::uint8_t len = 0;
     std::uint8_t size = 0;
     std::uint8_t burst = 0;
+    // An AHB fixed burst was cut short after this AXI command was issued.
+    // The bridge may legally finish the AXI write with zero-strobe padding,
+    // or drain the unread AXI read tail.
+    bool early_ahb_terminated = false;
 };
 
 struct ActiveBurst {
@@ -228,6 +232,10 @@ struct Stats {
     std::uint64_t read_mismatches = 0;
     std::uint64_t shadow_mismatches = 0;
     std::uint64_t burst_mismatches = 0;
+    std::uint64_t early_ahb_write_terminations = 0;
+    std::uint64_t early_ahb_read_terminations = 0;
+    std::uint64_t ahb_orphan_seq_beats = 0;
+    std::uint64_t ahb_address_progression_mismatches = 0;
     std::uint64_t warnings = 0;
     std::uint64_t notes = 0;
     std::uint64_t resync_events = 0;
@@ -427,6 +435,11 @@ class Analyzer {
             << "  shadow mismatches: " << stats_.shadow_mismatches << "\n"
             << "  burst mismatches:  " << stats_.burst_mismatches << "\n"
             << "  warnings:          " << stats_.warnings << "\n"
+            << "  AHB-side warnings:\n"
+            << "    early fixed write terminations: " << stats_.early_ahb_write_terminations << "\n"
+            << "    early fixed read terminations:  " << stats_.early_ahb_read_terminations << "\n"
+            << "    SEQ without tracked burst:       " << stats_.ahb_orphan_seq_beats << "\n"
+            << "    address progression mismatches:  " << stats_.ahb_address_progression_mismatches << "\n"
             << "  notes:             " << stats_.notes << "\n"
             << "  resync events:     " << stats_.resync_events << "\n"
             << "  pending ahb writes:" << expected_ahb_writes_.size() << "\n"
@@ -667,6 +680,50 @@ class Analyzer {
         }
     }
 
+    void mark_axi_burst_early_terminated(const AhbBurstDesc& ahb) {
+        auto matches = [&ahb](const AxiBurstDesc& axi) {
+            return axi.addr == ahb.start_addr && axi.size == ahb.size;
+        };
+
+        // The command can already be active, or it can still be waiting for
+        // its first W/R beat.  There is only one bridge transaction of either
+        // kind in flight, but match the address as a guard against a malformed
+        // trace being mistaken for padding/drain traffic.
+        if (ahb.is_write) {
+            if (active_write_ && matches(active_write_->desc)) {
+                active_write_->desc.early_ahb_terminated = true;
+            }
+            for (auto& axi : aw_queue_) {
+                if (matches(axi)) {
+                    axi.early_ahb_terminated = true;
+                }
+            }
+        } else {
+            if (active_read_ && matches(active_read_->desc)) {
+                active_read_->desc.early_ahb_terminated = true;
+            }
+            for (auto& axi : ar_queue_) {
+                if (matches(axi)) {
+                    axi.early_ahb_terminated = true;
+                }
+            }
+        }
+    }
+
+    void queue_early_terminated_read_completions(const ActiveAhbBurst& active) {
+        // The address phases already observed before the termination still
+        // have legal AHB data completions.  In a waveform sampled at clock
+        // edges, the corresponding AXI R handshake can be seen on the
+        // following sample, after the bridge has fenced/drained the old tail.
+        // Keep these completions distinct from arbitrary missing AXI R beats.
+        ActiveAhbBurst beat = active;
+        beat.last_addr = active.desc.start_addr;
+        for (std::uint32_t i = 0; i < active.beats_seen; ++i) {
+            early_terminated_ahb_read_completions_.push_back(beat.last_addr);
+            beat.last_addr = next_ahb_addr(beat);
+        }
+    }
+
     void finish_ahb_burst_early(std::optional<ActiveAhbBurst>& active,
                                 std::uint64_t time,
                                 const char* reason) {
@@ -677,9 +734,16 @@ class Analyzer {
             active->beats_seen > 0 &&
             active->beats_seen < active->desc.beats) {
             revise_pending_ahb_burst_length(active->desc, active->beats_seen);
+            mark_axi_burst_early_terminated(active->desc);
+            if (active->desc.is_write) {
+                stats_.early_ahb_write_terminations++;
+            } else {
+                stats_.early_ahb_read_terminations++;
+                queue_early_terminated_read_completions(*active);
+            }
             resync_note(std::string(active->desc.is_write ? "write" : "read") +
-                        " AHB " + ahb_burst_name(active->desc.burst) +
-                        " burst ended early at time=" + std::to_string(time) +
+                        " early AHB " + ahb_burst_name(active->desc.burst) +
+                        " burst termination at time=" + std::to_string(time) +
                         " reason=" + reason +
                         " beats_seen=" + std::to_string(active->beats_seen) +
                         " declared_beats=" + std::to_string(active->desc.beats));
@@ -692,14 +756,19 @@ class Analyzer {
         finish_ahb_burst_early(active_ahb_read_burst_, time, reason);
     }
 
-    void lose_read_sync(std::uint64_t time, const std::string& reason) {
-        warn("lost read synchronization at time=" + std::to_string(time) + ": " + reason);
+    void reset_read_tracking() {
         read_burst_synced_ = false;
         completed_axi_reads_.clear();
         ar_queue_.clear();
         active_read_.reset();
         pending_ahb_read_bursts_.clear();
         active_ahb_read_burst_.reset();
+        early_terminated_ahb_read_completions_.clear();
+    }
+
+    void lose_read_sync(std::uint64_t time, const std::string& reason) {
+        warn("lost read synchronization at time=" + std::to_string(time) + ": " + reason);
+        reset_read_tracking();
     }
 
     void lose_write_sync(std::uint64_t time, const std::string& reason) {
@@ -805,6 +874,7 @@ class Analyzer {
                 if (!active) {
                     const bool seen_any = is_write ? seen_any_ahb_write_burst_ : seen_any_ahb_read_burst_;
                     if (seen_any) {
+                        stats_.ahb_orphan_seq_beats++;
                         note(std::string("AHB SEQ beat without tracked NONSEQ at time=") +
                              std::to_string(time));
                     }
@@ -812,6 +882,7 @@ class Analyzer {
                     const auto expected_addr = next_ahb_addr(*active);
                     const auto actual_addr = addr & 0xffffffffULL;
                     if (expected_addr != actual_addr) {
+                        stats_.ahb_address_progression_mismatches++;
                         burst_mismatch(std::string(is_write ? "write" : "read") +
                                        " AHB burst address progression mismatch at time=" +
                                        std::to_string(time) +
@@ -920,11 +991,18 @@ class Analyzer {
         const auto addr = beat_addr(*active_write_) & 0xffffffffULL;
 
         if (expected_ahb_writes_.empty()) {
-            if (write_burst_synced_) {
+            // A streamed fixed write can issue AWLEN before all AHB beats are
+            // known.  If that AHB burst is terminated early, the bridge keeps
+            // AXI framing valid by padding the remaining beats with WSTRB=0.
+            // This is intentionally not an AHB-to-AXI data mismatch.
+            if (active_write_->desc.early_ahb_terminated && strb == 0) {
+                note("zero-strobe AXI W padding after early AHB write termination at time=" +
+                     std::to_string(time) + " addr=" + format_hex(addr, 32));
+            } else if (write_burst_synced_) {
                 lose_write_sync(time, "AXI W beat without prior AHB write beat at addr=" +
                                       format_hex(addr, 32));
+                return;
             }
-            return;
         } else {
             AhbWriteBeat expected = expected_ahb_writes_.front();
             if (expected.addr != addr && maybe_resync_write_one_beat(time, addr)) {
@@ -995,7 +1073,24 @@ class Analyzer {
     }
 
     void consume_ahb_read_completion(const AhbReadBeat& ahb) {
+        const bool early_termination_completion =
+            !early_terminated_ahb_read_completions_.empty() &&
+            early_terminated_ahb_read_completions_.front() == ahb.addr;
+        if (early_termination_completion) {
+            early_terminated_ahb_read_completions_.pop_front();
+        }
         if (completed_axi_reads_.empty()) {
+            if (early_termination_completion) {
+                note("AHB read completion retained across early AHB burst termination at time=" +
+                     std::to_string(ahb.time) + " addr=" + format_hex(ahb.addr, 32));
+                // This trace shape includes a replay/fence boundary for the
+                // interrupted read.  It is not possible to associate later
+                // public AXI R beats with it unambiguously, so restart normal
+                // reconstruction at the next observed command without
+                // reporting a bridge error.
+                reset_read_tracking();
+                return;
+            }
             if (read_burst_synced_) {
                 lose_read_sync(ahb.time, "AHB read completion without prior AXI R beat at addr=" +
                                          format_hex(ahb.addr, 32));
@@ -1075,6 +1170,7 @@ class Analyzer {
     std::optional<ActiveBurst> active_read_;
     std::optional<ActiveAhbBurst> active_ahb_write_burst_;
     std::optional<ActiveAhbBurst> active_ahb_read_burst_;
+    std::deque<std::uint64_t> early_terminated_ahb_read_completions_;
     std::unordered_map<std::uint64_t, std::uint8_t> shadow_memory_;
     bool seen_any_ahb_write_burst_ = false;
     bool seen_any_ahb_read_burst_ = false;

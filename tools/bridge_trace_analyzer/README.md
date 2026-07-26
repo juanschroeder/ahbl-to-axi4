@@ -20,6 +20,9 @@ signals for the bridge are traced from the top-level testbench.
   - write-side mismatches between AHB intent and AXI traffic
   - read-side sequencing mismatches
   - optional shadow-memory inconsistencies
+  - AHB-side traffic/protocol warnings, reported separately from bridge errors:
+    early fixed-burst termination, SEQ without a tracked burst, and burst
+    address-progression mismatches
 
 ## Build
 
@@ -64,4 +67,7 @@ Useful options:
   the exported per-sample table from the archive.
 - Legal but ambiguous reconstruction cases, such as early-terminated fixed AHB
   bursts or bounded read/write stream resynchronization, are counted as notes.
-  They are suppressed by default and printed with `--show-notes`.
+  They are suppressed by default and printed with `--show-notes`. Early fixed
+  burst termination is also counted in the `AHB-side warnings` summary because
+  it is not a bridge data-integrity error but is unusual AHB traffic that
+  warrants investigation at the manager/interconnect boundary.
