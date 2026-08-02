@@ -42,6 +42,11 @@ struct Options {
     std::size_t max_mismatches = 50;
     std::size_t progress_interval = 10000;
     bool shadow_memory = true;
+    // The shadow model represents ordinary, CPU-visible storage.  Low
+    // addresses are normally MMIO in this system (PLIC, CLINT, UART, ...),
+    // where a write need not be readable back and hardware can change a
+    // register independently of the CPU.
+    std::uint64_t shadow_mmio_below = 0x80000000ULL;
     bool verbose = false;
     bool show_notes = false;
 };
@@ -231,6 +236,8 @@ struct Stats {
     std::uint64_t write_mismatches = 0;
     std::uint64_t read_mismatches = 0;
     std::uint64_t shadow_mismatches = 0;
+    std::uint64_t shadow_mmio_writes_skipped = 0;
+    std::uint64_t shadow_mmio_reads_skipped = 0;
     std::uint64_t burst_mismatches = 0;
     std::uint64_t early_ahb_write_terminations = 0;
     std::uint64_t early_ahb_read_terminations = 0;
@@ -433,6 +440,8 @@ class Analyzer {
             << "  write mismatches:  " << stats_.write_mismatches << "\n"
             << "  read mismatches:   " << stats_.read_mismatches << "\n"
             << "  shadow mismatches: " << stats_.shadow_mismatches << "\n"
+            << "  shadow MMIO writes skipped: " << stats_.shadow_mmio_writes_skipped << "\n"
+            << "  shadow MMIO reads skipped:  " << stats_.shadow_mmio_reads_skipped << "\n"
             << "  burst mismatches:  " << stats_.burst_mismatches << "\n"
             << "  warnings:          " << stats_.warnings << "\n"
             << "  AHB-side warnings:\n"
@@ -1121,6 +1130,10 @@ class Analyzer {
     }
 
     void apply_shadow_write(std::uint64_t addr, std::uint64_t data, std::uint8_t strb) {
+        if (!is_shadow_memory_address(addr)) {
+            stats_.shadow_mmio_writes_skipped++;
+            return;
+        }
         const unsigned bytes = data_bus_bytes();
         for (unsigned i = 0; i < bytes; ++i) {
             if ((strb >> i) & 0x1U) {
@@ -1130,6 +1143,10 @@ class Analyzer {
     }
 
     void check_shadow_read(const char* side, std::uint64_t time, std::uint64_t addr, std::uint64_t data) {
+        if (!is_shadow_memory_address(addr)) {
+            stats_.shadow_mmio_reads_skipped++;
+            return;
+        }
         std::uint64_t expected = 0;
         const unsigned bytes = data_bus_bytes();
         for (unsigned i = 0; i < bytes; ++i) {
@@ -1154,6 +1171,11 @@ class Analyzer {
             return 8;
         }
         return static_cast<unsigned>((width + 7) / 8);
+    }
+
+    bool is_shadow_memory_address(std::uint64_t addr) const {
+        // A zero boundary explicitly means "shadow all addresses".
+        return options_.shadow_mmio_below == 0 || addr >= options_.shadow_mmio_below;
     }
 
     Options options_;
@@ -1747,6 +1769,8 @@ void print_usage(const char* argv0) {
         << "  --max-mismatches <n>\n"
         << "  --progress-interval <n>\n"
         << "  --no-shadow-memory\n"
+        << "  --shadow-mmio-below <addr>  Exclude lower addresses from RAM shadowing"
+           " (default: 0x80000000; 0 shadows all addresses)\n"
         << "  --show-notes\n"
         << "  --verbose\n";
 }
@@ -1787,6 +1811,13 @@ Options parse_args(int argc, char** argv) {
             options.progress_interval = std::strtoull(argv[++i], nullptr, 10);
         } else if (arg == "--no-shadow-memory") {
             options.shadow_memory = false;
+        } else if (arg == "--shadow-mmio-below" && i + 1 < argc) {
+            char* end = nullptr;
+            const char* text = argv[++i];
+            options.shadow_mmio_below = std::strtoull(text, &end, 0);
+            if (end == text || *end != '\0') {
+                throw std::runtime_error("invalid shadow MMIO boundary: " + std::string(text));
+            }
         } else if (arg == "--show-notes") {
             options.show_notes = true;
         } else if (arg == "--verbose") {
