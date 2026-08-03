@@ -828,7 +828,7 @@ class Analyzer {
                 consume_ahb_read_completion(
                     AhbReadBeat{time, pending.addr & 0xffffffffULL, data, pending.size});
                 if (options_.shadow_memory) {
-                    check_shadow_read("AHB", time, pending.addr & 0xffffffffULL, data);
+                    check_shadow_read("AHB", time, pending.addr & 0xffffffffULL, data, pending.size);
                 }
             }
             maybe_report_progress(time);
@@ -1064,7 +1064,7 @@ class Analyzer {
         completed_axi_reads_.push_back(AxiReadBeat{time, addr, data, active_read_->desc.size});
 
         if (options_.shadow_memory) {
-            check_shadow_read("AXI", time, addr, data);
+            check_shadow_read("AXI", time, addr, data, active_read_->desc.size);
         }
 
         const bool rlast = bit(state, SignalKey::RLast);
@@ -1142,26 +1142,39 @@ class Analyzer {
         }
     }
 
-    void check_shadow_read(const char* side, std::uint64_t time, std::uint64_t addr, std::uint64_t data) {
+    void check_shadow_read(const char* side, std::uint64_t time, std::uint64_t addr,
+                           std::uint64_t data, std::uint8_t size) {
         if (!is_shadow_memory_address(addr)) {
             stats_.shadow_mmio_reads_skipped++;
             return;
         }
+        const unsigned bus_bytes = data_bus_bytes();
+        const unsigned bytes = 1U << std::min<unsigned>(size, 6U);
+        const unsigned lane = static_cast<unsigned>(addr % bus_bytes);
+        // A transfer crossing the AXI data-beat boundary is not represented
+        // by one RDATA beat. Leave that case to the transport checks instead
+        // of manufacturing a shadow failure.
+        if (bytes > bus_bytes || lane + bytes > bus_bytes) {
+            return;
+        }
         std::uint64_t expected = 0;
-        const unsigned bytes = data_bus_bytes();
+        std::uint64_t actual = 0;
         for (unsigned i = 0; i < bytes; ++i) {
             const auto it = shadow_memory_.find(addr + i);
             if (it == shadow_memory_.end()) {
                 return;
             }
             expected |= static_cast<std::uint64_t>(it->second) << (8U * i);
+            actual |= ((data >> (8U * (lane + i))) & 0xffU) << (8U * i);
         }
 
-        if (expected != data) {
+        if (expected != actual) {
             shadow_mismatch(std::string(side) + " shadow mismatch at time=" + std::to_string(time) +
                             " addr=" + format_hex(addr, 32) +
                             " expected=" + format_hex(expected, 64) +
-                            " actual=" + format_hex(data, 64));
+                            " actual=" + format_hex(actual, 64) +
+                            " size=" + std::to_string(bytes) +
+                            " lane=" + std::to_string(lane));
         }
     }
 
