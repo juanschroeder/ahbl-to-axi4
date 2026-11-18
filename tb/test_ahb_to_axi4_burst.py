@@ -16446,3 +16446,82 @@ async def test_streamed_incr8_idle_gap_followon_does_not_duplicate_wlast(dut):
 
     await with_timeout(ready_task, 20, "us")
     await with_timeout(monitor_task, 20, "us")
+
+
+@cocotb.test()
+async def test_streamed_incr8_stalled_tail_preserves_pending_write(dut):
+    """A queued cache-line write must not overwrite a stalled predecessor."""
+    set_test_id(dut)
+    await setup_dut_no_axi_slave(dut)
+
+    addresses = [0x818A8300, 0x81878340]
+    data = [
+        [0, 0, 0, 0, 0, 0, 1, 0x00000000C1408C78],
+        [0xC1472BC0C01EB32A + i for i in range(8)],
+    ]
+    observed_aw = []
+    observed_w = []
+    stalled = Event()
+    done = Event()
+    dut.m_axi_awready.value = 1
+    dut.m_axi_wready.value = 1
+
+    async def axi_slave():
+        pending_b = 0
+        stalled_payload = None
+        while not done.is_set():
+            await FallingEdge(dut.clk)
+            await Timer(1, units="ns")
+            aw_fire = int(dut.m_axi_awvalid.value) and int(dut.m_axi_awready.value)
+            aw = (int(dut.m_axi_awaddr.value), int(dut.m_axi_awlen.value))
+            valid = int(dut.m_axi_wvalid.value)
+            ready = int(dut.m_axi_wready.value)
+            payload = (int(dut.m_axi_wdata.value),
+                       int(dut.m_axi_wstrb.value),
+                       int(dut.m_axi_wlast.value))
+            if stalled_payload is not None:
+                assert valid and payload == stalled_payload, (
+                    f"stalled AXI W changed: {stalled_payload!r} -> {payload!r}"
+                )
+            stalled_payload = payload if valid and not ready else None
+            b_fire = int(dut.m_axi_bvalid.value) and int(dut.m_axi_bready.value)
+            await RisingEdge(dut.clk)
+            if aw_fire:
+                observed_aw.append(aw)
+            if valid and ready:
+                observed_w.append(payload)
+                if payload[2]:
+                    pending_b += 1
+            if b_fire:
+                pending_b -= 1
+            await NextTimeStep()
+            dut.m_axi_bvalid.value = int(pending_b != 0)
+            if len(observed_w) == 6 and not stalled.is_set():
+                dut.m_axi_wready.value = 0
+                stalled.set()
+            if len(observed_w) == 16 and pending_b == 0:
+                done.set()
+
+    slave_task = cocotb.start_soon(axi_slave())
+    await with_timeout(
+        ahb_write_inc_burst_manual_with_hprot(
+            dut, addresses[0], data[0], size_bytes=8, fixed=True, hprot=0b0011
+        ), 30, "us"
+    )
+    await with_timeout(stalled.wait(), 30, "us")
+    await ClockCycles(dut.clk, 2)
+    second_write = cocotb.start_soon(ahb_write_inc_burst_manual_with_hprot(
+        dut, addresses[1], data[1], size_bytes=8, fixed=True, hprot=0b0011
+    ))
+    # Longer than the accumulator's wrap interval: the traced bug repeatedly
+    # overwrote the first burst with the pending burst's first data word.
+    await ClockCycles(dut.clk, 160)
+    await NextTimeStep()
+    dut.m_axi_wready.value = 1
+    await with_timeout(second_write, 30, "us")
+    await with_timeout(slave_task, 30, "us")
+
+    assert observed_aw == [(address, 7) for address in addresses]
+    assert observed_w == [
+        (word, 0xFF, int(i == 7)) for burst in data for i, word in enumerate(burst)
+    ]

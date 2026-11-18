@@ -1831,7 +1831,14 @@ module ahb_to_axi4_burst #(
   // that the current HWDATA is a real write data phase (ahb_wphase_valid).
   // Do NOT key this off raw HREADYIN alone: a legal BUSY / non-write cycle can
   // leave HREADYIN=1 while no fixed write beat is actually due.
-  assign fix_ahb_fire          = (state == ST_WR_D) && (pnd_wfirst_valid || ahb_wphase_valid);
+  // A streamed burst can remain here while AXI stalls after AHB has finished.
+  // Keep the pending transaction's data separate: recapturing it here wraps
+  // acc_cnt and overwrites the old burst's stalled W payload.
+  assign fix_ahb_fire          = (state == ST_WR_D) &&
+                                (!stream_fixed_write ||
+                                 (!pnd_valid && !stream_write_terminated &&
+                                  (acc_cnt_u8 <= ap_axlen))) &&
+                                (pnd_wfirst_valid || ahb_wphase_valid);
   assign fix_flush_wvalid      = (state == ST_WR_FIX_FLUSH) && aw_sent;
   assign fix_flush_last_issue  = fix_flush_wvalid && (flush_ptr == acc_cnt[IBUF_IDX_W-1:0] - 1'b1);
   // Compare the full accumulated count.  At a 16-beat configured burst,
